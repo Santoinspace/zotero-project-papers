@@ -1,24 +1,45 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+
+- Configurable project reference directory with `set-reference-dir`.
+- Existing reference-directory detection during initialization.
+- Three onboarding modes:
+  - `use-existing` — preserve the existing directory/tree;
+  - `separate` — leave it untouched and use a new directory;
+  - `merge` — recursively collect PDFs into one flat new directory while preserving the source.
+- `check` command comparing Zotero collection membership, generated manifest, and actual project PDFs.
+- Drift fingerprints and `check --ack-continue`, so an acknowledged mismatch is not repeatedly shown until it changes.
+- `check --reset-policy` to forget an acknowledged mismatch.
+- `reconcile` command with safe Zotero-as-canonical project refresh.
+- Explicit `reconcile --remove-local-only` for user-approved destructive cleanup only.
+- Detection of manually replaced formerly managed PDFs (`modifiedManagedFiles`).
+- Automatic absorption of a local-only reference PDF after successful Zotero import/reuse.
+- Automatic migration of v0.1 `.zotero-project.json` files to schema v2.
+
+### Changed
+
+- `papers/reference` is now only the default, not a fixed project path.
+- Skill entry now performs a cheap consistency check for initialized project-scoped literature tasks.
+- A repeated identical drift can be silently tolerated after the user chooses “continue”.
+- A new/changed drift fingerprint prompts again.
+- `sync` preserves user-modified formerly managed files instead of overwriting them.
+- `sync --prune` skips user-modified files.
+- First-time initialization no longer silently ignores likely existing reference/literature directories.
+
+### Safety
+
+- Project-side deletion still never deletes a Zotero library item.
+- Local-only PDFs are never removed by normal reconciliation.
+- Merge preserves the source directory and touches PDFs only.
+
 ## 0.1.2
 
-- Increased interactive Zotero authorization timeout to 300 seconds and added a clear waiting prompt.
-- Forced UTF-8-safe stdout/stderr handling on Windows to prevent GBK `UnicodeEncodeError` crashes.
-- Made CLI failures compact and structured; `--json` remains valid JSON and tracebacks require `ZPP_DEBUG=1`.
-- Added automatic `everything`/full-text fallback when metadata search returns zero results.
-- Made search results brief by default and added `--verbose` plus `show ITEM_KEY` for on-demand details.
-- Added `doctor` preflight for Local API, authorization state, project root, and best-effort Zotero executable discovery.
-- Added explicit `--project-root` support and corrected Skill instructions so the helper is invoked by absolute path without changing cwd to the Skill directory.
-- Added duplicate DOI/title warnings and creator-role metadata warnings to reduce silent library-quality problems.
-
-## 0.1.1
-
-- Repackaged as a CC Switch-friendly GitHub skill repository.
-- Moved the installable skill to `skills/zotero-project-papers/`.
-- Removed the self-copy installer from the managed skill; CC Switch is now the intended installer and SSOT manager.
-- Added Agent Skills `compatibility` and version metadata.
-- Updated helper version to `0.1.1`.
-
-## 0.1.0
-
-- Initial Zotero-first project-papers prototype.
+- Increased authorization wait to 300 seconds.
+- Forced UTF-8-safe Windows output.
+- Added structured JSON errors and `doctor`.
+- Added metadata-search → full-text fallback.
+- Reduced default search output and added `show`.
+- Added duplicate DOI/title and creator-role warnings.

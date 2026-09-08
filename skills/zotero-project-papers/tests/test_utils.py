@@ -72,5 +72,156 @@ class UtilsTests(unittest.TestCase):
                 self.assertTrue(os.path.samefile(src, dst))
 
 
+    def test_config_v1_migrates_to_v2(self):
+        cfg = zpp.normalize_project_config({
+            "schemaVersion": 1,
+            "collectionPath": "Projects/Test",
+            "collectionKey": "AAAA1111",
+            "referenceDir": "refs",
+            "manifestFile": "refs/papers.json",
+            "bibFile": "papers/references.bib",
+            "fallback": "copy",
+        })
+        self.assertEqual(cfg["schemaVersion"], 2)
+        self.assertEqual(cfg["sync"]["driftPolicy"], "prompt")
+
+    def test_detect_reference_dirs_with_subdirs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "references" / "survey").mkdir(parents=True)
+            (root / "references" / "survey" / "a.pdf").write_bytes(b"a")
+            rows = zpp.detect_reference_dirs(root)
+            row = next(x for x in rows if x["path"] == "references")
+            self.assertEqual(row["pdfCount"], 1)
+            self.assertTrue(row["hasSubdirectories"])
+
+    def test_flatten_reference_pdfs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source = root / "old"
+            target = root / "new"
+            (source / "a").mkdir(parents=True)
+            (source / "b").mkdir(parents=True)
+            (source / "a" / "same.pdf").write_bytes(b"one")
+            (source / "b" / "same.pdf").write_bytes(b"two")
+            rows = zpp.flatten_reference_pdfs(source, target, fallback="copy")
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(len(list(target.glob("*.pdf"))), 2)
+            self.assertFalse(any(x.is_dir() for x in target.iterdir()))
+
+    def test_flatten_when_target_is_parent_of_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            target = root / "references"
+            source = target / "nested"
+            source.mkdir(parents=True)
+            (source / "a.pdf").write_bytes(b"a")
+            rows = zpp.flatten_reference_pdfs(source, target, fallback="copy")
+            self.assertEqual(len(rows), 1)
+            self.assertTrue((target / "a.pdf").exists())
+
+    def test_acknowledged_drift_fingerprint(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = {
+                "schemaVersion": 2,
+                "collectionPath": "Projects/Test",
+                "collectionKey": "AAAA1111",
+                "referenceDir": "refs",
+                "manifestFile": "refs/papers.json",
+                "bibFile": "papers/references.bib",
+                "fallback": "copy",
+                "sync": zpp.default_sync_config(),
+            }
+            snap = {
+                "clean": False,
+                "fingerprint": "abc",
+                "needsPrompt": True,
+                "driftPolicy": "prompt",
+                "zoteroCount": 1,
+                "manifestCount": 1,
+                "localPdfCount": 2,
+                "drift": {"zoteroOnlyItemKeys": [], "manifestOnlyItemKeys": [], "missingManagedFiles": [], "modifiedManagedFiles": [], "localOnlyFiles": ["refs/x.pdf"]},
+            }
+            updated = zpp.persist_consistency_state(root, cfg, snap, acknowledge_continue=True)
+            self.assertFalse(updated["needsPrompt"])
+            self.assertEqual(cfg["sync"]["acknowledgedFingerprint"], "abc")
+            snap2 = dict(snap)
+            snap2["fingerprint"] = "def"
+            updated2 = zpp.persist_consistency_state(root, cfg, snap2)
+            self.assertTrue(updated2["needsPrompt"])
+
+    def test_user_modified_managed_path_is_not_selected_for_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref = root / "refs"
+            ref.mkdir()
+            src = root / "zotero.pdf"
+            src.write_bytes(b"canonical")
+            prior = ref / "zotero.pdf"
+            prior.write_bytes(b"user replacement")
+            chosen = zpp.choose_reference_filename(src, "AAAA1111", ref, str(prior))
+            self.assertNotEqual(chosen, prior)
+            self.assertEqual(prior.read_bytes(), b"user replacement")
+
+    def test_consistency_detects_modified_managed_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref = root / "refs"
+            ref.mkdir()
+            source = root / "zotero.pdf"
+            source.write_bytes(b"canonical")
+            project_pdf = ref / "paper.pdf"
+            project_pdf.write_bytes(b"replacement")
+            config = {
+                "schemaVersion": 2,
+                "collectionPath": "Projects/Test",
+                "collectionKey": "AAAA1111",
+                "referenceDir": "refs",
+                "manifestFile": "refs/papers.json",
+                "bibFile": "papers/references.bib",
+                "fallback": "copy",
+                "sync": zpp.default_sync_config(),
+            }
+            zpp.json_dump({
+                "papers": [{
+                    "itemKey": "ITEM0001",
+                    "projectPath": "refs/paper.pdf",
+                    "zoteroPath": str(source),
+                }]
+            }, root / "refs" / "papers.json")
+            original = zpp.collection_items
+            try:
+                zpp.collection_items = lambda client, collection_key, query=None, fulltext=False: [
+                    {"key": "ITEM0001", "data": {"key": "ITEM0001", "itemType": "journalArticle", "title": "Paper", "creators": []}}
+                ]
+                snap = zpp.consistency_snapshot(object(), root, config)
+            finally:
+                zpp.collection_items = original
+            self.assertIn("refs/paper.pdf", snap["drift"]["modifiedManagedFiles"])
+            self.assertFalse(snap["clean"])
+
+    def test_init_requires_onboarding_when_existing_reference_found(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "references").mkdir()
+            (root / "references" / "a.pdf").write_bytes(b"pdf")
+            args = type("Args", (), {
+                "project_root": str(root),
+                "force": False,
+                "onboarding": None,
+                "existing_dir": None,
+                "reference_dir": None,
+                "name": None,
+                "collection_root": "Projects",
+                "bib_file": None,
+                "fallback": "copy",
+            })()
+            with self.assertRaises(zpp.ZPPError) as ctx:
+                zpp.cmd_init(args)
+            self.assertEqual(ctx.exception.code, "onboarding_required")
+            self.assertEqual(ctx.exception.details["candidates"][0]["path"], "references")
+
+
 if __name__ == "__main__":
     unittest.main()

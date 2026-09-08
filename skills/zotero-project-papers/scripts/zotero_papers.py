@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.1.2
+"""zotero-project-papers v0.2.0
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -31,24 +31,35 @@ from typing import Any, Iterable
 APP_NAME = "Zotero Project Papers"
 BASE_URL = os.environ.get("ZOTERO_LOCAL_API", "http://127.0.0.1:23119/api/").rstrip("/") + "/"
 CONFIG_NAME = ".zotero-project.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_COLLECTION_ROOT = "Projects"
 DEFAULT_REFERENCE_DIR = "papers/reference"
 DEFAULT_BIB_FILE = "papers/references.bib"
 MANIFEST_NAME = "papers.json"
+REFERENCE_CANDIDATES = ("reference", "references", "refs", "literature", "literatures", "papers/reference", "papers/references")
 AUTH_TIMEOUT = int(os.environ.get("ZPP_AUTH_TIMEOUT", "300"))
 
 
 class ZPPError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "zpp_error", hint: str | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "zpp_error",
+        hint: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.hint = hint
+        self.details = details
 
     def as_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"type": self.code, "message": str(self)}
         if self.hint:
             data["hint"] = self.hint
+        if self.details:
+            data["details"] = self.details
         return data
 
 
@@ -164,6 +175,39 @@ def project_root(start: Path | None = None) -> Path:
     return cur
 
 
+def default_sync_config() -> dict[str, Any]:
+    return {
+        "state": "clean",
+        "driftPolicy": "prompt",
+        "acknowledgedFingerprint": None,
+        "acknowledgedAt": None,
+    }
+
+
+def normalize_project_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade older project configs in memory without breaking existing users."""
+    version = int(config.get("schemaVersion") or 1)
+    if version > SCHEMA_VERSION:
+        raise ZPPError(f"Unsupported {CONFIG_NAME} schemaVersion: {version}")
+    out = dict(config)
+    out["schemaVersion"] = SCHEMA_VERSION
+    out.setdefault("referenceDir", DEFAULT_REFERENCE_DIR)
+    out.setdefault("manifestFile", (Path(out["referenceDir"]) / MANIFEST_NAME).as_posix())
+    out.setdefault("bibFile", DEFAULT_BIB_FILE)
+    out.setdefault("fallback", "copy")
+    sync = default_sync_config()
+    existing_sync = out.get("sync")
+    if isinstance(existing_sync, dict):
+        sync.update(existing_sync)
+    out["sync"] = sync
+    return out
+
+
+def save_project_config(root: Path, config: dict[str, Any]) -> None:
+    config = normalize_project_config(config)
+    json_dump(config, root / CONFIG_NAME)
+
+
 def load_project(root: Path | None = None, required: bool = True) -> tuple[Path, dict[str, Any] | None]:
     root = project_root(root)
     path = root / CONFIG_NAME
@@ -172,12 +216,87 @@ def load_project(root: Path | None = None, required: bool = True) -> tuple[Path,
             raise ZPPError(f"Project is not initialized. Run `zotero_papers.py init` from {root}")
         return root, None
     try:
-        config = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise ZPPError(f"Cannot read {path}: {exc}") from exc
-    if config.get("schemaVersion") != SCHEMA_VERSION:
-        raise ZPPError(f"Unsupported {CONFIG_NAME} schemaVersion: {config.get('schemaVersion')}")
+    if not isinstance(raw, dict):
+        raise ZPPError(f"{path} must contain a JSON object")
+    config = normalize_project_config(raw)
+    if raw != config:
+        save_project_config(root, config)
     return root, config
+
+
+def detect_reference_dirs(root: Path) -> list[dict[str, Any]]:
+    """Find likely pre-existing literature folders without scanning the whole repository."""
+    found: list[dict[str, Any]] = []
+    seen: set[Path] = set()
+    for rel in REFERENCE_CANDIDATES:
+        path = (root / rel).resolve()
+        if path in seen or not path.is_dir():
+            continue
+        seen.add(path)
+        pdfs = [x for x in path.rglob("*.pdf") if x.is_file()]
+        if not pdfs and rel not in {"reference", "references", "refs", "literature", "literatures"}:
+            continue
+        subdirs = [x for x in path.iterdir() if x.is_dir()]
+        found.append({
+            "path": rel,
+            "pdfCount": len(pdfs),
+            "hasSubdirectories": bool(subdirs),
+        })
+    papers = (root / "papers").resolve()
+    if papers.is_dir() and papers not in seen:
+        direct_pdfs = [x for x in papers.glob("*.pdf") if x.is_file()]
+        if direct_pdfs:
+            found.append({"path": "papers", "pdfCount": len(direct_pdfs), "hasSubdirectories": any(x.is_dir() for x in papers.iterdir())})
+    return found
+
+
+def unique_flatten_destination(target: Path, source: Path) -> Path:
+    name = safe_filename(source.name)
+    dest = target / name
+    if not dest.exists():
+        return dest
+    try:
+        if os.path.samefile(source, dest):
+            return dest
+    except OSError:
+        pass
+    stem, suffix = os.path.splitext(name)
+    i = 2
+    while True:
+        candidate = target / f"{stem} [{i}]{suffix}"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def flatten_reference_pdfs(source_dir: Path, target_dir: Path, fallback: str = "copy") -> list[dict[str, str]]:
+    source_dir = source_dir.resolve()
+    target_dir = target_dir.resolve()
+    if source_dir == target_dir:
+        return []
+    pdfs = [p.resolve() for p in source_dir.rglob("*.pdf") if p.is_file()]
+    target_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, str]] = []
+    target_inside_source = is_within(target_dir, source_dir)
+    for source in pdfs:
+        if target_inside_source and is_within(source, target_dir):
+            continue
+        dest = unique_flatten_destination(target_dir, source)
+        if dest.exists():
+            try:
+                if os.path.samefile(source, dest):
+                    mode = "existing-hardlink-or-samefile"
+                else:
+                    mode = materialize_pdf(source, dest, fallback)
+            except OSError:
+                mode = materialize_pdf(source, dest, fallback)
+        else:
+            mode = materialize_pdf(source, dest, fallback)
+        results.append({"source": str(source), "destination": str(dest), "mode": mode})
+    return results
 
 
 @dataclass
@@ -611,10 +730,30 @@ def add_item_to_collection(client: ZoteroClient, item_key: str, collection_key: 
     return True
 
 
+def file_matches_source(source: Path, dest: Path) -> bool:
+    if not source.exists() or not dest.exists() or not dest.is_file():
+        return False
+    try:
+        if os.path.samefile(source, dest):
+            return True
+    except OSError:
+        pass
+    try:
+        a, b = source.stat(), dest.stat()
+        # copy2 preserves mtime; this is a cheap guard for cross-volume copy fallback.
+        return a.st_size == b.st_size and a.st_mtime_ns == b.st_mtime_ns
+    except OSError:
+        return False
+
+
 def choose_reference_filename(source: Path, item_key: str, reference_dir: Path, prior: str | None = None) -> Path:
     if prior:
         p = Path(prior)
-        return p if p.is_absolute() else reference_dir.parent.parent / p
+        p = p if p.is_absolute() else reference_dir.parent.parent / p
+        if not p.exists() or file_matches_source(source, p):
+            return p
+        # The user changed/replaced a formerly managed path. Preserve it and materialize
+        # the Zotero-owned PDF under a collision-safe new name instead of overwriting.
     name = safe_filename(source.name if source.suffix.casefold() == ".pdf" else source.name + ".pdf")
     dest = reference_dir / name
     if not dest.exists():
@@ -633,12 +772,15 @@ def materialize_pdf(source: Path, dest: Path, fallback: str = "copy") -> str:
         raise ZPPError(f"Zotero attachment file does not exist: {source}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
-        try:
-            if os.path.samefile(source, dest):
-                return "existing-hardlink-or-samefile"
-        except OSError:
-            pass
-        # Only overwrite a helper-managed path chosen for the same item; caller controls that.
+        if file_matches_source(source, dest):
+            try:
+                if os.path.samefile(source, dest):
+                    return "existing-hardlink-or-samefile"
+            except OSError:
+                pass
+            return "existing-copy"
+        # The destination here is either a fresh collision-safe path or an explicitly
+        # managed target. User-modified prior paths are filtered by choose_reference_filename.
         dest.unlink()
     try:
         os.link(source, dest)
@@ -680,6 +822,120 @@ def manifest_prior_paths(old_manifest: dict[str, Any]) -> dict[str, str]:
         if isinstance(p, dict) and p.get("itemKey") and p.get("projectPath"):
             out[str(p["itemKey"])] = str(p["projectPath"])
     return out
+
+
+def reference_pdf_files(root: Path, config: dict[str, Any]) -> list[Path]:
+    ref_dir = (root / config["referenceDir"]).resolve()
+    if not ref_dir.exists():
+        return []
+    return sorted((p.resolve() for p in ref_dir.rglob("*.pdf") if p.is_file()), key=lambda p: str(p).casefold())
+
+
+def consistency_snapshot(client: ZoteroClient, root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    rows = collection_items(client, config["collectionKey"])
+    zotero_keys = {str(item_summary(x, brief=True).get("key") or "") for x in rows}
+    zotero_keys.discard("")
+    manifest = load_old_manifest(root, config)
+    manifest_rows = [x for x in (manifest.get("papers") or []) if isinstance(x, dict)]
+    manifest_keys = {str(x.get("itemKey") or "") for x in manifest_rows}
+    manifest_keys.discard("")
+
+    managed_paths: set[str] = set()
+    missing_managed: list[str] = []
+    modified_managed: list[str] = []
+    for row in manifest_rows:
+        rel = row.get("projectPath")
+        if not rel:
+            continue
+        rel = str(rel)
+        rel_norm = Path(rel).as_posix()
+        managed_paths.add(rel_norm)
+        local_path = root / rel
+        if not local_path.exists():
+            missing_managed.append(rel_norm)
+            continue
+        zotero_path = row.get("zoteroPath")
+        if zotero_path:
+            source = Path(str(zotero_path))
+            if source.exists() and not file_matches_source(source, local_path):
+                modified_managed.append(rel_norm)
+
+    local_pdfs = reference_pdf_files(root, config)
+    local_rel = {relpath_for_manifest(x, root) for x in local_pdfs}
+    local_only = sorted(local_rel - managed_paths)
+    zotero_only = sorted(zotero_keys - manifest_keys)
+    manifest_only = sorted(manifest_keys - zotero_keys)
+    missing_managed = sorted(set(missing_managed))
+    modified_managed = sorted(set(modified_managed))
+
+    drift = {
+        "zoteroOnlyItemKeys": zotero_only,
+        "manifestOnlyItemKeys": manifest_only,
+        "missingManagedFiles": missing_managed,
+        "modifiedManagedFiles": modified_managed,
+        "localOnlyFiles": local_only,
+    }
+    canonical = json.dumps(drift, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    clean = not any(drift.values())
+    sync_cfg = config.get("sync") if isinstance(config.get("sync"), dict) else default_sync_config()
+    ack = sync_cfg.get("acknowledgedFingerprint")
+    policy = sync_cfg.get("driftPolicy", "prompt")
+    needs_prompt = (not clean) and not (policy == "continue" and ack == fingerprint)
+    return {
+        "clean": clean,
+        "fingerprint": fingerprint,
+        "needsPrompt": needs_prompt,
+        "driftPolicy": policy,
+        "zoteroCount": len(zotero_keys),
+        "manifestCount": len(manifest_keys),
+        "localPdfCount": len(local_rel),
+        "drift": drift,
+    }
+
+
+def persist_consistency_state(
+    root: Path,
+    config: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    acknowledge_continue: bool = False,
+    reset_policy: bool = False,
+) -> dict[str, Any]:
+    sync_cfg = default_sync_config()
+    if isinstance(config.get("sync"), dict):
+        sync_cfg.update(config["sync"])
+    if snapshot["clean"]:
+        sync_cfg.update(default_sync_config())
+        sync_cfg["lastCheckedAt"] = utc_now()
+    else:
+        sync_cfg["state"] = "diverged"
+        sync_cfg["lastCheckedAt"] = utc_now()
+        if reset_policy:
+            sync_cfg["driftPolicy"] = "prompt"
+            sync_cfg["acknowledgedFingerprint"] = None
+            sync_cfg["acknowledgedAt"] = None
+        if acknowledge_continue:
+            sync_cfg["driftPolicy"] = "continue"
+            sync_cfg["acknowledgedFingerprint"] = snapshot["fingerprint"]
+            sync_cfg["acknowledgedAt"] = utc_now()
+    config["sync"] = sync_cfg
+    save_project_config(root, config)
+    updated = dict(snapshot)
+    updated["driftPolicy"] = sync_cfg.get("driftPolicy")
+    updated["needsPrompt"] = (not updated["clean"]) and not (
+        sync_cfg.get("driftPolicy") == "continue"
+        and sync_cfg.get("acknowledgedFingerprint") == updated["fingerprint"]
+    )
+    return updated
+
+
+def is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def project_record(client: ZoteroClient, obj: dict[str, Any], root: Path, config: dict[str, Any], prior_path: str | None = None) -> dict[str, Any]:
@@ -739,6 +995,7 @@ def sync_project(client: ZoteroClient, root: Path, config: dict[str, Any], prune
     write_bib(client, root, config)
 
     pruned: list[str] = []
+    prune_skipped_modified: list[str] = []
     if prune:
         desired = {p.get("projectPath") for p in papers if p.get("projectPath")}
         ref_dir = (root / config["referenceDir"]).resolve()
@@ -752,8 +1009,14 @@ def sync_project(client: ZoteroClient, root: Path, config: dict[str, Any], prune
             except ValueError:
                 continue
             if candidate.exists() and candidate.is_file():
+                zotero_path = p.get("zoteroPath") if isinstance(p, dict) else None
+                if zotero_path and Path(str(zotero_path)).exists() and not file_matches_source(Path(str(zotero_path)), candidate):
+                    prune_skipped_modified.append(relpath_for_manifest(candidate, root))
+                    continue
                 candidate.unlink()
                 pruned.append(relpath_for_manifest(candidate, root))
+    snapshot = consistency_snapshot(client, root, config)
+    consistency = persist_consistency_state(root, config, snapshot)
     return {
         "projectRoot": str(root),
         "collection": config["collectionPath"],
@@ -762,6 +1025,8 @@ def sync_project(client: ZoteroClient, root: Path, config: dict[str, Any], prune
         "manifest": config["manifestFile"],
         "bib": config["bibFile"],
         "pruned": pruned,
+        "pruneSkippedModified": prune_skipped_modified,
+        "consistency": consistency,
         "papers": papers,
     }
 
@@ -856,6 +1121,16 @@ def requested_project_root(args: argparse.Namespace) -> Path | None:
     return Path(value).expanduser().resolve() if value else None
 
 
+def project_relative_path(value: str, *, label: str) -> str:
+    path = Path(value)
+    if path.is_absolute():
+        raise ZPPError(f"{label} must be relative to the project root: {value}", code="invalid_project_path")
+    normalized = Path(os.path.normpath(str(path)))
+    if normalized == Path(".") or ".." in normalized.parts:
+        raise ZPPError(f"{label} must stay inside the project root: {value}", code="invalid_project_path")
+    return normalized.as_posix()
+
+
 def find_zotero_executable() -> str | None:
     candidates: list[Path] = []
     if os.name == "nt":
@@ -910,13 +1185,16 @@ def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
         checks.append({"name": "zotero-local-api", "ok": False, "error": exc.as_dict()})
 
     config_path = root / CONFIG_NAME
-    checks.append({
+    project_check = {
         "name": "project-root",
         "ok": True,
         "path": str(root),
         "initialized": config_path.exists(),
         "hint": None if config_path.exists() else "Run `init` from the intended project root before project-scoped operations.",
-    })
+    }
+    if not config_path.exists():
+        project_check["referenceCandidates"] = detect_reference_dirs(root)
+    checks.append(project_check)
     executable = find_zotero_executable()
     checks.append({
         "name": "zotero-executable",
@@ -947,10 +1225,147 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    client = ZoteroClient()
+    client.bootstrap()
+    snapshot = consistency_snapshot(client, root, config)
+    snapshot = persist_consistency_state(
+        root,
+        config,
+        snapshot,
+        acknowledge_continue=args.ack_continue,
+        reset_policy=args.reset_policy,
+    )
+    if snapshot["clean"]:
+        recommendation = "continue"
+    elif snapshot["needsPrompt"]:
+        recommendation = "ask-user"
+    else:
+        recommendation = "continue-with-acknowledged-drift"
+    return {
+        "ok": True,
+        "projectRoot": str(root),
+        "collection": config["collectionPath"],
+        "referenceDir": config["referenceDir"],
+        "status": "clean" if snapshot["clean"] else "diverged",
+        "recommendation": recommendation,
+        "consistency": snapshot,
+    }
+
+
 def cmd_authorize(args: argparse.Namespace) -> dict[str, Any]:
     client = ZoteroClient()
     client.bootstrap()
     return client.authorize(require_remembered=not args.allow_once)
+
+
+def cmd_set_reference_dir(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    new_rel = project_relative_path(args.reference_dir, label="reference directory")
+    old_rel = str(config["referenceDir"])
+    if Path(new_rel) == Path(old_rel):
+        return {"changed": False, "projectRoot": str(root), "referenceDir": new_rel, "config": config}
+
+    new_dir = root / new_rel
+    existing_pdfs = [p for p in new_dir.rglob("*.pdf") if p.is_file()] if new_dir.exists() else []
+    if existing_pdfs and not args.allow_existing_target:
+        raise ZPPError(
+            f"Target reference directory already contains {len(existing_pdfs)} PDF(s): {new_rel}",
+            code="reference_target_not_empty",
+            hint="Ask the user whether to use/merge this directory, then rerun with --allow-existing-target if confirmed.",
+            details={"referenceDir": new_rel, "pdfCount": len(existing_pdfs)},
+        )
+
+    old_manifest = load_old_manifest(root, config)
+    old_manifest_path = root / config["manifestFile"]
+    config["referenceDir"] = new_rel
+    config["manifestFile"] = (Path(new_rel) / MANIFEST_NAME).as_posix()
+    config["sync"] = default_sync_config()
+    save_project_config(root, config)
+
+    client = ZoteroClient()
+    client.bootstrap()
+    sync = sync_project(client, root, config, prune=False)
+
+    removed: list[str] = []
+    if not args.keep_old:
+        old_ref = (root / old_rel).resolve()
+        for row in old_manifest.get("papers", []) or []:
+            if not isinstance(row, dict) or not row.get("projectPath"):
+                continue
+            candidate = (root / str(row["projectPath"])).resolve()
+            if not is_within(candidate, old_ref):
+                continue
+            if candidate.exists() and candidate.is_file():
+                candidate.unlink()
+                removed.append(relpath_for_manifest(candidate, root))
+        if old_manifest_path.exists() and is_within(old_manifest_path, old_ref):
+            try:
+                old_manifest_path.unlink()
+            except OSError:
+                pass
+
+    return {
+        "changed": True,
+        "projectRoot": str(root),
+        "oldReferenceDir": old_rel,
+        "referenceDir": new_rel,
+        "removedOldManagedFiles": removed,
+        "sync": {k: v for k, v in sync.items() if k != "papers"},
+    }
+
+
+def cmd_reconcile(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    client = ZoteroClient()
+    client.bootstrap()
+
+    before = consistency_snapshot(client, root, config)
+    removed_local_only: list[str] = []
+    if args.remove_local_only:
+        # Explicitly destructive: only delete PDFs that are not represented by the current manifest.
+        for rel in before["drift"]["localOnlyFiles"]:
+            candidate = (root / rel).resolve()
+            ref_dir = (root / config["referenceDir"]).resolve()
+            if is_within(candidate, ref_dir) and candidate.exists() and candidate.is_file():
+                candidate.unlink()
+                removed_local_only.append(rel)
+
+    sync = sync_project(client, root, config, prune=args.prune)
+    after = consistency_snapshot(client, root, config)
+    if args.remove_local_only and after["drift"]["localOnlyFiles"]:
+        # A manually replaced managed path can become local-only only after canonical
+        # rematerialization. Honor the explicit destructive option in the same command.
+        ref_dir = (root / config["referenceDir"]).resolve()
+        for rel in list(after["drift"]["localOnlyFiles"]):
+            if rel in removed_local_only:
+                continue
+            candidate = (root / rel).resolve()
+            if is_within(candidate, ref_dir) and candidate.exists() and candidate.is_file():
+                candidate.unlink()
+                removed_local_only.append(rel)
+        sync = sync_project(client, root, config, prune=args.prune)
+        after = consistency_snapshot(client, root, config)
+    after = persist_consistency_state(root, config, after, reset_policy=True)
+    unresolved = after["drift"]["localOnlyFiles"]
+    return {
+        "ok": True,
+        "projectRoot": str(root),
+        "before": before,
+        "after": after,
+        "removedLocalOnlyFiles": removed_local_only,
+        "unresolvedLocalOnlyFiles": unresolved,
+        "hint": (
+            "Local-only PDFs remain. To fully unify, import each wanted PDF into Zotero with import-pdf, or explicitly remove files the user does not want."
+            if unresolved
+            else "Reference workspace is unified with the Zotero project collection."
+        ),
+        "sync": {k: v for k, v in sync.items() if k != "papers"},
+    }
 
 
 def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
@@ -961,32 +1376,83 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
         assert config is not None
         return {"initialized": True, "existing": True, "projectRoot": str(root), "config": config}
 
-    if args.reference_dir:
-        reference_dir = args.reference_dir
-    elif (root / "reference").exists() and not (root / "papers").exists():
-        reference_dir = "reference"
+    candidates = detect_reference_dirs(root)
+    onboarding = args.onboarding
+    existing_dir = args.existing_dir
+    if existing_dir:
+        existing_dir = project_relative_path(existing_dir, label="existing reference directory")
+
+    # Existing literature should never be silently ignored or flattened. Ask the Agent/user
+    # to choose an onboarding strategy unless the caller already supplied one explicitly.
+    if candidates and not onboarding and not args.reference_dir:
+        raise ZPPError(
+            "Existing reference/literature directory detected; choose how Zotero Project Papers should onboard it.",
+            code="onboarding_required",
+            hint="Choose use-existing, separate, or merge. Merge flattens PDFs into the new reference directory and preserves the source directory.",
+            details={
+                "candidates": candidates,
+                "options": ["use-existing", "separate", "merge"],
+                "defaultNewDirectory": DEFAULT_REFERENCE_DIR,
+            },
+        )
+
+    if onboarding in {"use-existing", "merge"}:
+        if not existing_dir:
+            if len(candidates) == 1:
+                existing_dir = str(candidates[0]["path"])
+            else:
+                raise ZPPError(
+                    "Specify --existing-dir when more than one existing reference directory is possible.",
+                    code="existing_reference_ambiguous",
+                    details={"candidates": candidates},
+                )
+        source = root / existing_dir
+        if not source.is_dir():
+            raise ZPPError(f"Existing reference directory not found: {existing_dir}", code="existing_reference_missing")
+
+    if onboarding == "use-existing":
+        assert existing_dir is not None
+        reference_dir = existing_dir
     else:
-        reference_dir = DEFAULT_REFERENCE_DIR
+        reference_dir = project_relative_path(args.reference_dir or DEFAULT_REFERENCE_DIR, label="reference directory")
+
+    if onboarding == "separate" and existing_dir and Path(reference_dir) == Path(existing_dir):
+        raise ZPPError("Separate onboarding requires a different --reference-dir from --existing-dir.", code="invalid_onboarding")
+    if onboarding == "merge" and existing_dir and Path(reference_dir) == Path(existing_dir):
+        raise ZPPError("Merge onboarding requires a new --reference-dir different from the existing directory.", code="invalid_onboarding")
 
     project_name = args.name or root.name
     client = ZoteroClient()
     client.bootstrap()
     collection_key = ensure_collection_path(client, [args.collection_root, project_name])
     manifest_file = (Path(reference_dir) / MANIFEST_NAME).as_posix()
-    bib_file = args.bib_file or ("references.bib" if reference_dir == "reference" else DEFAULT_BIB_FILE)
+    bib_file = project_relative_path(args.bib_file or DEFAULT_BIB_FILE, label="BibTeX output")
     config = {
         "schemaVersion": SCHEMA_VERSION,
         "collectionPath": f"{args.collection_root}/{project_name}",
         "collectionKey": collection_key,
         "referenceDir": Path(reference_dir).as_posix(),
         "manifestFile": manifest_file,
-        "bibFile": Path(bib_file).as_posix(),
+        "bibFile": bib_file,
         "fallback": args.fallback,
+        "sync": default_sync_config(),
     }
     (root / reference_dir).mkdir(parents=True, exist_ok=True)
-    json_dump(config, existing_path)
+    save_project_config(root, config)
+
+    merged: list[dict[str, str]] = []
+    if onboarding == "merge" and existing_dir:
+        merged = flatten_reference_pdfs(root / existing_dir, root / reference_dir, args.fallback)
+
     result = sync_project(client, root, config, prune=False)
-    result.update({"initialized": True, "existing": False, "config": config})
+    result.update({
+        "initialized": True,
+        "existing": False,
+        "config": config,
+        "onboarding": onboarding or "new",
+        "detectedReferenceDirectories": candidates,
+        "mergedLocalPdfs": merged,
+    })
     return result
 
 
@@ -1097,7 +1563,7 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
     if not pdf.exists() or not pdf.is_file():
         raise ZPPError(f"PDF not found: {pdf}")
     if pdf.suffix.casefold() != ".pdf":
-        raise ZPPError("v0.1 import-pdf accepts .pdf files only")
+        raise ZPPError("import-pdf accepts .pdf files only")
     metadata_path = Path(args.metadata).expanduser().resolve()
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1108,17 +1574,27 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
 
     client = ZoteroClient()
     client.bootstrap()
+    reference_dir = (root / config["referenceDir"]).resolve()
+    input_is_local_reference = is_within(pdf, reference_dir)
     duplicates = find_duplicates(client, metadata)
     if duplicates:
         duplicate = duplicates[0]
         key = item_summary(duplicate, brief=True)["key"]
         changed = add_item_to_collection(client, key, config["collectionKey"])
+        absorbed = False
+        available = [a for a in pdf_attachments(client, key) if a.get("path")]
+        if input_is_local_reference and available and pdf.exists():
+            # Zotero already owns a recoverable PDF. Remove the local-only copy/link so sync can
+            # rematerialize the canonical attachment at the project path.
+            pdf.unlink()
+            absorbed = True
         sync = sync_project(client, root, config, prune=False)
         record = next((p for p in sync["papers"] if p.get("itemKey") == key), None)
         response = {
             "action": "reused-existing",
             "itemKey": key,
             "addedToCollection": changed,
+            "absorbedLocalReference": absorbed,
             "paper": record,
             "note": "A local duplicate was found; no new Zotero item or PDF was created.",
         }
@@ -1145,9 +1621,21 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
             + f" were created, but PDF upload did not complete: {exc}. Search Zotero before retrying."
         ) from exc
 
+    absorbed = False
+    if input_is_local_reference and pdf.exists():
+        # Upload is complete and Zotero now owns the canonical stored attachment. Remove the
+        # pre-existing local-only PDF; sync will recreate it as a managed hardlink/copy view.
+        pdf.unlink()
+        absorbed = True
     sync = sync_project(client, root, config, prune=False)
     record = next((p for p in sync["papers"] if p.get("itemKey") == item_key), None)
-    return {"action": "imported", "itemKey": item_key, "attachmentKey": attachment_key, "paper": record}
+    return {
+        "action": "imported",
+        "itemKey": item_key,
+        "attachmentKey": attachment_key,
+        "absorbedLocalReference": absorbed,
+        "paper": record,
+    }
 
 
 def print_result(result: Any, as_json: bool) -> None:
@@ -1161,7 +1649,7 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.1.2")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.2.0")
     p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1173,6 +1661,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
 
+    s = sub.add_parser("check", help="Cheap consistency check for Zotero collection, manifest, and reference PDFs")
+    s.add_argument("--ack-continue", action="store_true", help="Remember the current drift fingerprint and continue without prompting until it changes")
+    s.add_argument("--reset-policy", action="store_true", help="Forget any remembered continue decision and prompt again while drift remains")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_check)
+
     s = sub.add_parser("authorize", help="Ask Zotero 10 for local write permission")
     s.add_argument("--allow-once", action="store_true", help="Accept one-shot authorization (not enough for PDF imports)")
     s.add_argument("--json", action="store_true")
@@ -1182,11 +1676,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--name", help="Project/collection name (default: repository directory name)")
     s.add_argument("--collection-root", default=DEFAULT_COLLECTION_ROOT)
     s.add_argument("--reference-dir", help=f"Project PDF working directory (default: {DEFAULT_REFERENCE_DIR})")
+    s.add_argument("--existing-dir", help="Existing reference/literature directory selected during onboarding")
+    s.add_argument("--onboarding", choices=["use-existing", "separate", "merge"], help="How to handle a detected existing literature directory")
     s.add_argument("--bib-file", help=f"BibTeX output path (default: {DEFAULT_BIB_FILE})")
     s.add_argument("--fallback", choices=["copy", "symlink", "none"], default="copy")
     s.add_argument("--force", action="store_true", help="Reinitialize project config")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("set-reference-dir", help="Change the project reference directory and rematerialize managed PDFs")
+    s.add_argument("reference_dir")
+    s.add_argument("--allow-existing-target", action="store_true", help="Allow a target directory that already contains PDFs")
+    s.add_argument("--keep-old", action="store_true", help="Keep old helper-managed PDF links/copies instead of cleaning them")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_set_reference_dir)
 
     s = sub.add_parser("search", help="Search project collection or full local Zotero library")
     s.add_argument("query")
@@ -1217,6 +1720,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--prune", action="store_true", help="Remove stale helper-managed project files only")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_sync)
+
+    s = sub.add_parser("reconcile", help="Unify the project view toward the Zotero collection without deleting Zotero items")
+    s.add_argument("--prune", action="store_true", help="Remove stale helper-managed project files")
+    s.add_argument("--remove-local-only", action="store_true", help="Explicitly delete local-only PDFs instead of importing/keeping them")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_reconcile)
 
     s = sub.add_parser("fulltext", help="Return Zotero-indexed full text for an item/PDF attachment")
     s.add_argument("item_key")
