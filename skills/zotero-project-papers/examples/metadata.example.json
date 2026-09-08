@@ -1,0 +1,17 @@
+{
+  "itemType": "journalArticle",
+  "title": "Example Paper Title",
+  "creators": [
+    {
+      "creatorType": "author",
+      "firstName": "Ada",
+      "lastName": "Lovelace"
+    }
+  ],
+  "abstractNote": "Replace with the abstract when available.",
+  "date": "2026",
+  "DOI": "10.1234/example",
+  "url": "https://example.org/paper",
+  "publicationTitle": "Example Journal",
+  "language": "en"
+}
