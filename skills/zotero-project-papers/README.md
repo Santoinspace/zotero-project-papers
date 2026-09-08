@@ -1,4 +1,4 @@
-# zotero-project-papers v0.1.1
+# zotero-project-papers v0.1.2
 
 A small Agent Skill + stdlib-only Python helper that makes **Zotero the canonical paper library** and a repository's `papers/reference/` the **agent-facing working set**.
 
@@ -30,12 +30,14 @@ For development only, the entire `zotero-project-papers` directory can still be 
 
 ## First run
 
-From any research/coding repository:
+Invoke the helper by absolute path **without changing away from the user's project directory**. Start with:
 
 ```bash
-python ~/.claude/skills/zotero-project-papers/scripts/zotero_papers.py status
+python ~/.claude/skills/zotero-project-papers/scripts/zotero_papers.py doctor --json
 python ~/.claude/skills/zotero-project-papers/scripts/zotero_papers.py init
 ```
+
+If an agent host cannot preserve cwd, pass `--project-root <repo-path>` before the subcommand.
 
 On the first write operation, run:
 
@@ -43,7 +45,7 @@ On the first write operation, run:
 python ~/.claude/skills/zotero-project-papers/scripts/zotero_papers.py authorize
 ```
 
-Choose **Always Allow** in Zotero. The helper stores the resulting local-only Zotero write key in the user's config directory with restrictive file permissions where supported.
+Choose **Always Allow** in Zotero. The authorization request waits up to 5 minutes for the user. The helper stores the resulting local-only Zotero write key in the user's config directory with restrictive file permissions where supported.
 
 ## Project files
 
@@ -66,7 +68,7 @@ Projects/
 └─ <repo-name>/
 ```
 
-## Important v0.1 limits
+## Important v0.1.x limits
 
 - Requires Zotero 10; it intentionally does not support Zotero 7–9 write bridges.
 - Does not perform web search itself. The host agent does that after local misses.
@@ -75,6 +77,16 @@ Projects/
 - Does not delete Zotero items.
 - `sync` is additive unless `--prune` is explicitly requested.
 - Hard links require source and destination on the same filesystem/volume. Default fallback is a normal copy; configure `fallback` to `symlink` if preferred.
+
+## v0.1.2 reliability changes
+
+- Windows stdout/stderr is forced to UTF-8 with replacement fallback.
+- `authorize` waits up to 300 seconds and prints a human-action hint.
+- `--json` failures stay valid JSON; tracebacks require `ZPP_DEBUG=1`.
+- zero-result metadata search automatically retries full-text/everything search;
+- search is brief by default; use `--verbose` or `show ITEM_KEY` for detail;
+- `doctor` checks Zotero/API/auth/project-root basics;
+- duplicate DOI/title and suspicious creator-role ordering are surfaced as warnings.
 
 ## Configuration
 

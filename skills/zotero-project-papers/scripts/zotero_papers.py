@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.1.1
+"""zotero-project-papers v0.1.2
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -14,6 +14,7 @@ import mimetypes
 import os
 import re
 import shutil
+import socket
 import stat
 import sys
 import tempfile
@@ -35,10 +36,31 @@ DEFAULT_COLLECTION_ROOT = "Projects"
 DEFAULT_REFERENCE_DIR = "papers/reference"
 DEFAULT_BIB_FILE = "papers/references.bib"
 MANIFEST_NAME = "papers.json"
+AUTH_TIMEOUT = int(os.environ.get("ZPP_AUTH_TIMEOUT", "300"))
 
 
 class ZPPError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, code: str = "zpp_error", hint: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.hint = hint
+
+    def as_dict(self) -> dict[str, Any]:
+        data: dict[str, Any] = {"type": self.code, "message": str(self)}
+        if self.hint:
+            data["hint"] = self.hint
+        return data
+
+
+def configure_stdio_utf8() -> None:
+    """Make CLI output safe on Windows consoles using legacy encodings such as GBK."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
 
 
 def utc_now() -> str:
@@ -201,16 +223,38 @@ class ZoteroClient:
         except urllib.error.HTTPError as exc:
             payload = exc.read()
             detail = payload.decode("utf-8", errors="replace").strip()
-            hint = ""
+            hint: str | None = None
+            code = f"zotero_http_{exc.code}"
             if exc.code == 403 and "local/authorize" not in url:
-                hint = " Ensure Zotero Settings → Advanced → Allow other applications... is enabled."
-            if exc.code == 401:
-                hint = " Local write authorization is missing/expired; run `authorize`."
-            if exc.code == 412:
-                hint = " Zotero state changed; rerun the command to refresh local versions."
-            raise ZPPError(f"Zotero HTTP {exc.code} for {method} {url}: {detail or exc.reason}.{hint}") from exc
+                hint = "Enable Zotero Settings → Advanced → Allow other applications on this computer to communicate with Zotero."
+            elif exc.code == 401:
+                hint = "Local write authorization is missing or expired; run `authorize`."
+            elif exc.code == 412:
+                hint = "Zotero state changed; rerun the command to refresh local versions."
+            raise ZPPError(
+                f"Zotero HTTP {exc.code} for {method} {url}: {detail or exc.reason}.",
+                code=code,
+                hint=hint,
+            ) from exc
         except urllib.error.URLError as exc:
-            raise ZPPError(f"Cannot reach Zotero Local API at {self.base_url}: {exc.reason}. Is Zotero running?") from exc
+            reason = exc.reason
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise ZPPError(
+                    f"Timed out waiting for Zotero after {timeout} seconds.",
+                    code="timeout",
+                    hint="If Zotero is showing an authorization dialog, approve it there and retry.",
+                ) from exc
+            raise ZPPError(
+                f"Cannot reach Zotero Local API at {self.base_url}: {reason}.",
+                code="zotero_unreachable",
+                hint="Make sure Zotero 10+ is running and local application communication is enabled.",
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise ZPPError(
+                f"Timed out waiting for Zotero after {timeout} seconds.",
+                code="timeout",
+                hint="If Zotero is showing an authorization dialog, approve it there and retry.",
+            ) from exc
 
     def bootstrap(self) -> None:
         result = self._raw_request("GET", "")
@@ -241,7 +285,14 @@ class ZoteroClient:
             "Zotero-Server-ID": self.server_id or "",
             "Zotero-API-Version": "3",
         }
-        result = self._raw_request("POST", "local/authorize", body=payload, headers=headers)
+        print(
+            f"Waiting for Zotero authorization (up to {AUTH_TIMEOUT}s). In Zotero, choose 'Always Allow' for persistent access.",
+            file=sys.stderr,
+            flush=True,
+        )
+        result = self._raw_request(
+            "POST", "local/authorize", body=payload, headers=headers, timeout=AUTH_TIMEOUT
+        )
         data = result.json()
         key = data.get("key") if isinstance(data, dict) else None
         remembered = bool(data.get("remember")) if isinstance(data, dict) else False
@@ -360,27 +411,71 @@ def item_data(obj: dict[str, Any]) -> dict[str, Any]:
     return data if isinstance(data, dict) else obj
 
 
-def item_summary(obj: dict[str, Any]) -> dict[str, Any]:
+def creator_name(c: dict[str, Any]) -> str:
+    if c.get("name"):
+        return str(c["name"])
+    return " ".join(x for x in [str(c.get("firstName", "")), str(c.get("lastName", ""))] if x).strip()
+
+
+def metadata_warnings(obj: dict[str, Any]) -> list[str]:
     d = item_data(obj)
-    creators = []
-    for c in d.get("creators", []) or []:
-        if c.get("name"):
-            creators.append(c["name"])
-        else:
-            creators.append(" ".join(x for x in [c.get("firstName", ""), c.get("lastName", "")] if x).strip())
-    return {
+    creators = [c for c in (d.get("creators") or []) if isinstance(c, dict)]
+    warnings: list[str] = []
+    author_positions = [i for i, c in enumerate(creators) if c.get("creatorType") == "author"]
+    if creators and author_positions and author_positions[0] > 0:
+        warnings.append("Non-author creators precede the first author; verify creator roles before relying on exported BibTeX.")
+    if creators and not author_positions and d.get("itemType") not in {"book", "encyclopediaArticle", "dictionaryEntry"}:
+        warnings.append("No creator is marked as an author; verify Zotero metadata before citation export.")
+    return warnings
+
+
+def item_summary(obj: dict[str, Any], *, brief: bool = False) -> dict[str, Any]:
+    d = item_data(obj)
+    creators_raw = [c for c in (d.get("creators") or []) if isinstance(c, dict)]
+    result: dict[str, Any] = {
         "key": d.get("key") or obj.get("key"),
         "itemType": d.get("itemType"),
         "title": d.get("title", ""),
-        "creators": creators,
+        "creators": [creator_name(c) for c in creators_raw],
         "date": d.get("date", ""),
         "DOI": d.get("DOI", ""),
-        "url": d.get("url", ""),
         "publicationTitle": d.get("publicationTitle", ""),
-        "abstractNote": d.get("abstractNote", ""),
-        "tags": [t.get("tag") for t in d.get("tags", []) if isinstance(t, dict) and t.get("tag")],
-        "collections": d.get("collections", []) or [],
     }
+    if brief:
+        return result
+    result.update(
+        {
+            "creatorsDetailed": creators_raw,
+            "url": d.get("url", ""),
+            "abstractNote": d.get("abstractNote", ""),
+            "tags": [t.get("tag") for t in d.get("tags", []) if isinstance(t, dict) and t.get("tag")],
+            "collections": d.get("collections", []) or [],
+            "metadataWarnings": metadata_warnings(obj),
+        }
+    )
+    return result
+
+
+def duplicate_warnings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_doi: dict[str, list[str]] = {}
+    by_title: dict[str, list[str]] = {}
+    for obj in rows:
+        s = item_summary(obj, brief=True)
+        key = str(s.get("key") or "")
+        doi = normalize_doi(str(s.get("DOI") or ""))
+        title = normalize_title(str(s.get("title") or ""))
+        if doi:
+            by_doi.setdefault(doi, []).append(key)
+        elif title:
+            by_title.setdefault(title, []).append(key)
+    warnings: list[dict[str, Any]] = []
+    for doi, keys in by_doi.items():
+        if len(keys) > 1:
+            warnings.append({"type": "duplicate-doi", "DOI": doi, "itemKeys": keys})
+    for title, keys in by_title.items():
+        if len(keys) > 1:
+            warnings.append({"type": "duplicate-title", "normalizedTitle": title, "itemKeys": keys})
+    return warnings
 
 
 def list_collections(client: ZoteroClient) -> list[dict[str, Any]]:
@@ -476,20 +571,30 @@ def library_search(client: ZoteroClient, query: str, fulltext: bool = False, lim
     return out
 
 
-def find_duplicate(client: ZoteroClient, metadata: dict[str, Any]) -> dict[str, Any] | None:
+def find_duplicates(client: ZoteroClient, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    matches: dict[str, dict[str, Any]] = {}
     doi = normalize_doi(str(metadata.get("DOI") or ""))
     if doi:
         for obj in library_search(client, doi, fulltext=True, limit=100):
             d = item_data(obj)
             if normalize_doi(str(d.get("DOI") or "")) == doi:
-                return obj
+                key = str(item_summary(obj, brief=True).get("key") or "")
+                if key:
+                    matches[key] = obj
     title = str(metadata.get("title") or "").strip()
     if title:
         target = normalize_title(title)
         for obj in library_search(client, title, fulltext=False, limit=100):
             if normalize_title(str(item_data(obj).get("title") or "")) == target:
-                return obj
-    return None
+                key = str(item_summary(obj, brief=True).get("key") or "")
+                if key:
+                    matches[key] = obj
+    return list(matches.values())
+
+
+def find_duplicate(client: ZoteroClient, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    matches = find_duplicates(client, metadata)
+    return matches[0] if matches else None
 
 
 def add_item_to_collection(client: ZoteroClient, item_key: str, collection_key: str) -> bool:
@@ -746,10 +851,90 @@ def upload_attachment_file(client: ZoteroClient, attachment_key: str, pdf: Path)
 # ---------- Commands ----------
 
 
+def requested_project_root(args: argparse.Namespace) -> Path | None:
+    value = getattr(args, "project_root", None) or os.environ.get("ZPP_PROJECT_ROOT")
+    return Path(value).expanduser().resolve() if value else None
+
+
+def find_zotero_executable() -> str | None:
+    candidates: list[Path] = []
+    if os.name == "nt":
+        for env_name in ("PROGRAMFILES", "PROGRAMFILES(X86)"):
+            base = os.environ.get(env_name)
+            if base:
+                candidates.append(Path(base) / "Zotero" / "zotero.exe")
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(Path(local) / "Programs" / "Zotero" / "zotero.exe")
+        try:
+            import winreg  # type: ignore
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for key_name in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\zotero.exe", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\zotero.exe"):
+                    try:
+                        with winreg.OpenKey(hive, key_name) as key:
+                            value, _ = winreg.QueryValueEx(key, None)
+                            if value:
+                                candidates.insert(0, Path(value))
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/Zotero.app/Contents/MacOS/zotero"))
+    else:
+        for path in ("/usr/bin/zotero", "/usr/local/bin/zotero"):
+            candidates.append(Path(path))
+        found = shutil.which("zotero")
+        if found:
+            candidates.insert(0, Path(found))
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("zotero")
+
+
+def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
+    root = project_root(requested_project_root(args))
+    checks: list[dict[str, Any]] = []
+    client = ZoteroClient()
+    try:
+        client.bootstrap()
+        checks.append({"name": "zotero-local-api", "ok": True, "serverID": client.server_id, "apiVersion": client.api_version})
+        checks.append({
+            "name": "write-authorization",
+            "ok": bool(client.api_key),
+            "status": "authorized" if client.api_key else "not-authorized",
+            "hint": None if client.api_key else "Run `authorize` when a write operation is needed, then choose Always Allow in Zotero.",
+        })
+    except ZPPError as exc:
+        checks.append({"name": "zotero-local-api", "ok": False, "error": exc.as_dict()})
+
+    config_path = root / CONFIG_NAME
+    checks.append({
+        "name": "project-root",
+        "ok": True,
+        "path": str(root),
+        "initialized": config_path.exists(),
+        "hint": None if config_path.exists() else "Run `init` from the intended project root before project-scoped operations.",
+    })
+    executable = find_zotero_executable()
+    checks.append({
+        "name": "zotero-executable",
+        "ok": bool(executable),
+        "path": executable,
+        "hint": None if executable else "Zotero executable was not found in common locations; this is informational if Zotero is already running.",
+    })
+    return {
+        "ok": all(c.get("ok") for c in checks if c["name"] in {"zotero-local-api", "project-root"}),
+        "projectRoot": str(root),
+        "checks": checks,
+    }
+
+
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
     client = ZoteroClient()
     client.bootstrap()
-    root, config = load_project(required=False)
+    root, config = load_project(requested_project_root(args), required=False)
     return {
         "ok": True,
         "zoteroBase": client.base_url,
@@ -769,7 +954,7 @@ def cmd_authorize(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
-    root = project_root()
+    root = project_root(requested_project_root(args))
     existing_path = root / CONFIG_NAME
     if existing_path.exists() and not args.force:
         _, config = load_project(root)
@@ -806,20 +991,46 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
-    root, config = load_project(required=args.scope == "project")
+    root, config = load_project(requested_project_root(args), required=args.scope == "project")
     client = ZoteroClient()
     client.bootstrap()
-    if args.scope == "project":
-        assert config is not None
-        rows = collection_items(client, config["collectionKey"], args.query, args.fulltext)
-    else:
-        rows = library_search(client, args.query, args.fulltext, args.limit)
-    summaries = [item_summary(x) for x in rows[: args.limit]]
-    return {"scope": args.scope, "query": args.query, "count": len(summaries), "items": summaries}
+
+    def run(fulltext: bool) -> list[dict[str, Any]]:
+        if args.scope == "project":
+            assert config is not None
+            return collection_items(client, config["collectionKey"], args.query, fulltext)
+        return library_search(client, args.query, fulltext, args.limit)
+
+    used_fulltext = bool(args.fulltext)
+    rows = run(used_fulltext)
+    fallback_used = False
+    if not rows and not used_fulltext and not args.no_fulltext_fallback:
+        rows = run(True)
+        used_fulltext = True
+        fallback_used = True
+
+    selected = rows[: args.limit]
+    summaries = [item_summary(x, brief=not args.verbose) for x in selected]
+    return {
+        "scope": args.scope,
+        "query": args.query,
+        "count": len(summaries),
+        "searchMode": "everything" if used_fulltext else "titleCreatorYear",
+        "fulltextFallbackUsed": fallback_used,
+        "items": summaries,
+        "warnings": duplicate_warnings(selected),
+    }
+
+
+def cmd_show(args: argparse.Namespace) -> dict[str, Any]:
+    client = ZoteroClient()
+    client.bootstrap()
+    obj = get_item(client, args.item_key)
+    return {"item": item_summary(obj, brief=False), "attachments": pdf_attachments(client, args.item_key)}
 
 
 def cmd_resolve(args: argparse.Namespace) -> dict[str, Any]:
-    root, config = load_project(required=False)
+    root, config = load_project(requested_project_root(args), required=False)
     client = ZoteroClient()
     client.bootstrap()
     obj = get_item(client, args.item_key)
@@ -833,7 +1044,7 @@ def cmd_resolve(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_add(args: argparse.Namespace) -> dict[str, Any]:
-    root, config = load_project()
+    root, config = load_project(requested_project_root(args))
     assert config is not None
     client = ZoteroClient()
     client.bootstrap()
@@ -844,7 +1055,7 @@ def cmd_add(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_sync(args: argparse.Namespace) -> dict[str, Any]:
-    root, config = load_project()
+    root, config = load_project(requested_project_root(args))
     assert config is not None
     client = ZoteroClient()
     client.bootstrap()
@@ -880,7 +1091,7 @@ def cmd_fulltext(args: argparse.Namespace) -> dict[str, Any] | str:
 
 
 def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
-    root, config = load_project()
+    root, config = load_project(requested_project_root(args))
     assert config is not None
     pdf = Path(args.pdf).expanduser().resolve()
     if not pdf.exists() or not pdf.is_file():
@@ -897,19 +1108,27 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
 
     client = ZoteroClient()
     client.bootstrap()
-    duplicate = find_duplicate(client, metadata)
-    if duplicate:
-        key = item_summary(duplicate)["key"]
+    duplicates = find_duplicates(client, metadata)
+    if duplicates:
+        duplicate = duplicates[0]
+        key = item_summary(duplicate, brief=True)["key"]
         changed = add_item_to_collection(client, key, config["collectionKey"])
         sync = sync_project(client, root, config, prune=False)
         record = next((p for p in sync["papers"] if p.get("itemKey") == key), None)
-        return {
+        response = {
             "action": "reused-existing",
             "itemKey": key,
             "addedToCollection": changed,
             "paper": record,
-            "note": "An obvious local duplicate was found; no new Zotero item or PDF was created.",
+            "note": "A local duplicate was found; no new Zotero item or PDF was created.",
         }
+        if len(duplicates) > 1:
+            response["warnings"] = [{
+                "type": "multiple-local-duplicates",
+                "message": "Multiple Zotero items match this DOI/title. One existing item was reused; consider cleaning duplicates in Zotero.",
+                "itemKeys": [item_summary(x, brief=True)["key"] for x in duplicates],
+            }]
+        return response
 
     # Multi-write path: require a remembered key before mutating anything.
     client.ensure_write_auth(require_remembered=True)
@@ -942,8 +1161,13 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.1.1")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.1.2")
+    p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("doctor", help="Preflight Zotero, authorization, and project-root checks")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_doctor)
 
     s = sub.add_parser("status", help="Check Zotero Local API and project binding")
     s.add_argument("--json", action="store_true")
@@ -967,10 +1191,17 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("search", help="Search project collection or full local Zotero library")
     s.add_argument("query")
     s.add_argument("--scope", choices=["project", "library"], default="project")
-    s.add_argument("--fulltext", action="store_true", help="Use Zotero quicksearch 'everything' mode")
+    s.add_argument("--fulltext", action="store_true", help="Start directly with Zotero quicksearch 'everything' mode")
+    s.add_argument("--no-fulltext-fallback", action="store_true", help="Do not retry an empty metadata search with full-text/everything search")
+    s.add_argument("--verbose", action="store_true", help="Include abstract, tags, collections, and detailed creator metadata")
     s.add_argument("--limit", type=int, default=20)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("show", help="Show full metadata and attachments for one Zotero item")
+    s.add_argument("item_key")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_show)
 
     s = sub.add_parser("resolve", help="Resolve a Zotero item to local PDF attachment path(s)")
     s.add_argument("item_key")
@@ -1003,21 +1234,43 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio_utf8()
     parser = build_parser()
     args = parser.parse_args(argv)
+    as_json = bool(getattr(args, "json", False))
     try:
         result = args.func(args)
-        print_result(result, getattr(args, "json", False))
+        print_result(result, as_json)
         return 0
-    except ZPPError as exc:
-        if getattr(args, "json", False):
-            print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
-        else:
-            print(f"error: {exc}", file=sys.stderr)
-        return 2
     except KeyboardInterrupt:
-        print("interrupted", file=sys.stderr)
+        err = ZPPError("Interrupted by user.", code="interrupted")
+        if as_json:
+            print(json.dumps({"ok": False, "error": err.as_dict()}, ensure_ascii=False, indent=2))
+        else:
+            print(f"error: {err}", file=sys.stderr)
         return 130
+    except Exception as exc:
+        if isinstance(exc, ZPPError):
+            err = exc
+        elif isinstance(exc, (TimeoutError, socket.timeout)):
+            err = ZPPError("Operation timed out.", code="timeout", hint="Check Zotero for a pending authorization dialog and retry.")
+        else:
+            err = ZPPError(
+                str(exc) or exc.__class__.__name__,
+                code="unexpected_error",
+                hint="Run again with ZPP_DEBUG=1 if a developer traceback is needed.",
+            )
+        if os.environ.get("ZPP_DEBUG") == "1":
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+        if as_json:
+            # Keep stdout machine-readable even on failure.
+            print(json.dumps({"ok": False, "error": err.as_dict()}, ensure_ascii=False, indent=2))
+        else:
+            print(f"error: {err}", file=sys.stderr)
+            if err.hint:
+                print(f"hint: {err.hint}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

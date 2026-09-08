@@ -78,7 +78,7 @@ In Zotero, enable:
 
 Keep Zotero running while the skill is being used.
 
-No third-party Python packages are required for v0.1.1.
+No third-party Python packages are required for v0.1.2.
 
 ---
 
@@ -115,7 +115,7 @@ zotero-project-papers
 
 Click **Install**, then enable or sync it to the agents you want to use, such as Claude Code or Codex.
 
-After that, let CC Switch manage the installed copies and future updates.
+After that, let CC Switch manage the installed copies and future updates. **Do not edit the installed copy inside CC Switch's managed Skill directory**, because updates can overwrite those changes.
 
 > If the repository provides an `ccswitch://` install link, clicking it can add the Skill repository to CC Switch directly.
 
@@ -140,7 +140,7 @@ Then ask naturally:
 
 On first use, the Skill will:
 
-1. check that Zotero is available;
+1. run a lightweight preflight (`doctor`) to check Zotero, authorization state, and the detected project root;
 2. initialize the current repository if needed;
 3. create or reuse `Projects/<project-name>` in Zotero;
 4. request Zotero write authorization only when a write operation is actually needed;
@@ -192,6 +192,14 @@ You do not need to mention the Skill explicitly. Requests involving research pap
 > Find the original paper for this method, read the implementation details, and help me reproduce it in this repository.
 
 ---
+
+## Faster, more reliable local search
+
+Searches now return brief metadata by default so an agent does not spend thousands of tokens on abstracts for candidates it may never use. If a normal title/author/year search returns **zero results**, the helper automatically retries Zotero's broader `everything` search, which can find terms that occur only in abstracts or indexed PDF text.
+
+This is especially useful for dataset names, acronyms, benchmark names, and method nicknames. For a promising item, the agent can then fetch full metadata with `show ITEM_KEY` or read the actual PDF.
+
+The helper also reports exact duplicate DOI/title matches in returned candidate sets. Zotero remains responsible for the underlying bibliographic metadata; suspicious creator-role ordering is surfaced as a warning rather than silently rewritten.
 
 ## How paper lookup works
 
@@ -251,7 +259,7 @@ papers/reference/example-paper.pdf
 
 but Zotero and the project can refer to the same underlying PDF data.
 
-If a hard link cannot be created, the default fallback in v0.1.1 is a normal copy. A project can also be configured to use symbolic links instead.
+If a hard link cannot be created, the default fallback in v0.1.2 is a normal copy. A project can also be configured to use symbolic links instead.
 
 ---
 
@@ -303,9 +311,21 @@ The project reference directory is a working view of the project's literature, n
 
 ---
 
+## Reliability improvements in v0.1.2
+
+The first real-world test uncovered several agent-host edge cases that are now handled directly:
+
+- **Human authorization waits up to 5 minutes.** Zotero authorization no longer fails after a 30-second timeout while the user is reading the dialog.
+- **UTF-8 CLI output on Windows.** Unicode characters in titles/abstracts no longer crash GBK consoles.
+- **Compact structured errors.** `--json` returns machine-readable errors without a 40-line traceback; set `ZPP_DEBUG=1` only for debugging.
+- **Automatic full-text fallback.** Empty metadata searches retry Zotero `everything` search automatically.
+- **Token-efficient search.** Candidate search results are brief by default; detailed metadata is fetched only for selected items.
+- **`doctor` preflight.** One command checks the Local API, authorization state, likely Zotero executable path, and detected project root.
+- **Explicit project-root handling.** The helper should be invoked by absolute path while the shell remains in the user's project; `--project-root` is available when needed.
+
 ## Current limitations
 
-v0.1.1 intentionally keeps the workflow small and predictable.
+v0.1.2 intentionally keeps the workflow small and predictable.
 
 - Zotero 10+ is required.
 - Web search is performed by the host agent, not by this Skill itself.
@@ -323,27 +343,29 @@ These limits are deliberate: the project aims to connect Zotero and coding agent
 
 Most users should not need these commands directly. They are useful for troubleshooting and development.
 
-From the installed Skill directory:
+**Keep the shell working directory in your research/coding project.** Invoke the installed helper by its absolute path; do not `cd` into the Skill directory before project-scoped commands. For example:
 
 ```bash
-python scripts/zotero_papers.py status
-python scripts/zotero_papers.py authorize
-python scripts/zotero_papers.py init
-python scripts/zotero_papers.py search "query" --scope project --json
-python scripts/zotero_papers.py search "query" --scope library --json
-python scripts/zotero_papers.py resolve ITEM_KEY --json
-python scripts/zotero_papers.py add ITEM_KEY --json
-python scripts/zotero_papers.py sync --json
-python scripts/zotero_papers.py fulltext ITEM_KEY
+python <skill-directory>/scripts/zotero_papers.py doctor --json
+python <skill-directory>/scripts/zotero_papers.py status
+python <skill-directory>/scripts/zotero_papers.py authorize
+python <skill-directory>/scripts/zotero_papers.py init
+python <skill-directory>/scripts/zotero_papers.py search "query" --scope project --json
+python <skill-directory>/scripts/zotero_papers.py search "query" --scope library --json
+python <skill-directory>/scripts/zotero_papers.py show ITEM_KEY --json
+python <skill-directory>/scripts/zotero_papers.py resolve ITEM_KEY --json
+python <skill-directory>/scripts/zotero_papers.py add ITEM_KEY --json
+python <skill-directory>/scripts/zotero_papers.py sync --json
+python <skill-directory>/scripts/zotero_papers.py fulltext ITEM_KEY
 ```
 
-Run:
+If cwd cannot be preserved, pass the repository explicitly **before the subcommand**:
 
 ```bash
-python scripts/zotero_papers.py --help
+python <skill-directory>/scripts/zotero_papers.py --project-root /path/to/repo doctor --json
 ```
 
-for the complete command reference.
+Run `python <skill-directory>/scripts/zotero_papers.py --help` for the complete command reference.
 
 ---
 
@@ -405,7 +427,7 @@ python scripts/zotero_papers.py --help
 python -m unittest discover -s tests -v
 ```
 
-No third-party Python packages are required for v0.1.1.
+No third-party Python packages are required for v0.1.2.
 
 ---
 
@@ -417,83 +439,4 @@ If the coding agent already has web search, this project should use that rather 
 
 Zotero Project Papers focuses on the missing bridge:
 
-> **Use Zotero as the long-term paper library, make the current project's literature visible to the agent, and search the web only when the local library is not enoug**
-
-# zotero-project-papers — CC Switch repository
-
-This repository is laid out for **CC Switch** skill discovery and management.
-
-The actual Agent Skill lives at:
-
-```text
-skills/zotero-project-papers/
-```
-
-It makes Zotero the canonical local paper library and exposes the papers relevant to the current coding/research repository through `papers/reference/` for Claude Code, Codex, and other compatible coding agents.
-
-## Install and manage with CC Switch
-
-After publishing this directory as a GitHub repository:
-
-1. Open **CC Switch → Skills → Repository Management**.
-2. Choose **Add Repository**.
-3. Enter:
-   - **Owner**: your GitHub username or organization
-   - **Name**: this repository name
-   - **Branch**: `main`
-   - **Subdirectory**: `skills`
-4. Refresh the Skills list.
-5. Find **zotero-project-papers** and click **Install**.
-6. Enable/sync it to Claude Code, Codex, or any other supported agent you want to use.
-
-### Optional one-click CC Switch deep link
-
-After the repository has a permanent GitHub owner/name, you can publish a one-click import link in this form:
-
-```text
-ccswitch://v1/import?resource=skill&repo=OWNER/REPO&branch=main&skills_path=skills&directory=zotero-project-papers
-```
-
-Replace `OWNER/REPO` with the real GitHub repository. The link opens CC Switch and imports the skill repository configuration; the user can then install/enable the skill from the Skills panel.
-
-CC Switch keeps the managed source copy in its skill store and distributes it to the selected agent directories according to your configured sync method. When this GitHub repository changes, CC Switch can detect the changed content and offer an update.
-
-## Why `skills/zotero-project-papers/` instead of putting `SKILL.md` at repository root?
-
-This is the standard multi-skill repository layout and works cleanly with CC Switch custom repositories. It also avoids historical CC Switch URL-install edge cases involving a root-level `SKILL.md`.
-
-## Repository layout
-
-```text
-.
-├── README.md
-├── .gitignore
-└── skills/
-    └── zotero-project-papers/
-        ├── SKILL.md
-        ├── README.md
-        ├── scripts/
-        │   └── zotero_papers.py
-        ├── examples/
-        │   └── metadata.example.json
-        └── tests/
-            └── test_utils.py
-```
-
-## Runtime requirements
-
-- Zotero 10+ running locally
-- Zotero local application communication enabled
-- Python 3.10+
-
-No Python package installation is required for v0.1.1.
-
-## Development check
-
-From the skill directory:
-
-```bash
-python scripts/zotero_papers.py --version
-python scripts/zotero_papers.py --help
-python -m unittest discover -s tests -v
-```
+> **Use Zotero as the long-term paper library, make the current project's literature visible to the agent, and search the web only when the local library is not enough.**

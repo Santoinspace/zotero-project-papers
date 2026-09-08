@@ -3,7 +3,7 @@ name: zotero-project-papers
 description: Use Zotero as the canonical local paper library for coding and research projects. Trigger when the user asks to search, find, read, compare, cite, review, implement, or write from research papers, literature, related work, prior work, or evidence. Search the current project's Zotero collection first, then the whole local Zotero library, and use web search only when local Zotero is insufficient. Keep papers actually used by the project in its Zotero collection and expose their Zotero-managed PDFs through the project's papers/reference directory.
 compatibility: Requires Zotero 10+ running locally with local application communication enabled and Python 3.10+. Designed for coding agents that can run local Python scripts; web search is optional and supplied by the host agent.
 metadata:
-  version: "0.1.1"
+  version: "0.1.2"
 ---
 
 # Zotero Project Papers
@@ -17,9 +17,11 @@ The user should not need to think about Zotero attachment keys, `storage/XXXXXXX
 - Zotero 10+ is installed and running.
 - Zotero Settings → Advanced → **Allow other applications on this computer to communicate with Zotero** is enabled.
 - Python 3.10+ is available.
-- The helper is stdlib-only; do not install Python packages for v0.1.
+- The helper is stdlib-only; do not install Python packages for v0.1.x.
 
-Run the helper from this skill's own directory. Resolve `scripts/zotero_papers.py` relative to this `SKILL.md`; do not copy the helper into the user's repository. In shell examples below, `$ZPP` means:
+Resolve `scripts/zotero_papers.py` relative to this `SKILL.md`, but **do not change the shell working directory to the skill directory**. Invoke the helper by absolute path while keeping the agent's current working directory at the user's project. Project discovery is based on the current working directory (or explicit `--project-root`). Do not copy the helper into the user's repository.
+
+In shell examples below, `$ZPP` means the helper invoked by absolute path from the current project directory:
 
 ```bash
 ZPP="python <this-skill-directory>/scripts/zotero_papers.py"
@@ -59,11 +61,13 @@ Do not trigger for ordinary coding that does not benefit from research literatur
 
 ## First use in a repository
 
-1. Check Zotero connectivity:
+1. Run one preflight check from the user's project directory:
 
 ```bash
-$ZPP status
+$ZPP doctor --json
 ```
+
+Use `doctor` to check Zotero connectivity, likely Zotero executable location, local write authorization state, and the detected project root. If the detected project root is wrong, keep the shell cwd at the actual repository or pass `--project-root <path>` before the subcommand.
 
 2. If the repo is not initialized, initialize it:
 
@@ -79,7 +83,7 @@ This creates/uses a Zotero collection `Projects/<repo-name>`, creates `papers/re
 $ZPP authorize
 ```
 
-Tell the user to choose **Always Allow** in Zotero. Persistent authorization is needed for multi-step stored-PDF imports. Do not request authorization for read-only work.
+Tell the user to choose **Always Allow** in Zotero. The helper waits up to 5 minutes for the human authorization dialog instead of timing out after 30 seconds. Persistent authorization is needed for multi-step stored-PDF imports. Do not request authorization for read-only work.
 
 ## Search workflow
 
@@ -87,6 +91,14 @@ Tell the user to choose **Always Allow** in Zotero. Persistent authorization is 
 
 ```bash
 $ZPP search "QUERY" --scope project --json
+```
+
+Search output is intentionally brief (key/title/creators/date/DOI/venue) to reduce agent token usage. If the metadata search returns zero items, the helper automatically retries Zotero's `everything` search so terms that occur only in abstracts or indexed PDFs can still be found. Use `--no-fulltext-fallback` only when this retry is undesirable.
+
+If results are promising, fetch details for a specific paper rather than requesting large abstracts for every candidate:
+
+```bash
+$ZPP show ITEM_KEY --json
 ```
 
 If the result is sufficient, use it. Resolve/read PDFs as needed:
@@ -103,13 +115,13 @@ If project search is insufficient:
 $ZPP search "QUERY" --scope library --json
 ```
 
-Use `--fulltext` when the concept may occur inside PDFs rather than metadata:
+The zero-result fallback is automatic. Use `--fulltext` immediately when the query is a dataset name, acronym, method nickname, benchmark name, or another term likely to appear only in abstracts/PDF text:
 
 ```bash
 $ZPP search "QUERY" --scope library --fulltext --json
 ```
 
-If a locally available paper becomes relevant to the current project:
+If metadata results are non-empty but clearly weak/irrelevant, also retry with `--fulltext`. If a locally available paper becomes relevant to the current project:
 
 ```bash
 $ZPP add ITEM_KEY --json
@@ -234,7 +246,8 @@ Before writing a literature-grounded claim:
 - Never modify `zotero.sqlite` directly.
 - Never copy/download directly into `Zotero/storage`.
 - Never permanently delete library items through this skill.
-- Avoid creating duplicate bibliographic items; search locally first.
+- Avoid creating duplicate bibliographic items; search locally first. If search/import reports duplicate DOI/title warnings, reuse one existing item and tell the user the Zotero library contains duplicates rather than silently creating another.
+- Zotero metadata is not assumed correct. If `show`, `papers.json`, or another result reports creator-role warnings (for example editors before authors), flag it before relying on generated BibTeX; do not silently rewrite bibliographic authors.
 - Do not import weak web-search candidates just because they appeared in results.
 - Do not overwrite unrelated files in `papers/reference/`.
 - On same-volume filesystems, prefer hard links so the project and Zotero refer to one underlying PDF data stream.
@@ -243,10 +256,12 @@ Before writing a literature-grounded claim:
 ## Useful commands
 
 ```bash
+$ZPP doctor --json
 $ZPP status
 $ZPP authorize
 $ZPP init [--reference-dir papers/reference]
-$ZPP search "query" --scope project|library [--fulltext] --json
+$ZPP search "query" --scope project|library [--fulltext] [--verbose] --json
+$ZPP show ITEM_KEY --json
 $ZPP resolve ITEM_KEY --json
 $ZPP add ITEM_KEY --json
 $ZPP import-pdf FILE.pdf --metadata metadata.json --json
@@ -254,4 +269,4 @@ $ZPP sync [--prune] --json
 $ZPP fulltext ITEM_KEY [--max-chars N]
 ```
 
-If the helper returns a structured error, fix the stated prerequisite or report it clearly; do not bypass Zotero by manipulating its database or storage directory.
+The helper keeps `--json` output machine-readable on failures and suppresses Python tracebacks by default. Follow the returned `error.message`/`error.hint`; use `ZPP_DEBUG=1` only when a developer traceback is actually needed. Do not bypass Zotero by manipulating its database or storage directory.

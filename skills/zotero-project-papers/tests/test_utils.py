@@ -29,6 +29,36 @@ class UtilsTests(unittest.TestCase):
     def test_parse_file_url_posix(self):
         self.assertEqual(zpp.parse_file_url("file:///tmp/a%20b.pdf"), Path("/tmp/a b.pdf"))
 
+
+    def test_duplicate_warnings_doi(self):
+        rows = [
+            {"key": "AAAA1111", "data": {"key": "AAAA1111", "itemType": "journalArticle", "title": "A", "DOI": "10.1/x", "creators": []}},
+            {"key": "BBBB2222", "data": {"key": "BBBB2222", "itemType": "journalArticle", "title": "B", "DOI": "https://doi.org/10.1/X", "creators": []}},
+        ]
+        warnings = zpp.duplicate_warnings(rows)
+        self.assertEqual(warnings[0]["type"], "duplicate-doi")
+        self.assertEqual(set(warnings[0]["itemKeys"]), {"AAAA1111", "BBBB2222"})
+
+    def test_metadata_warning_editor_before_author(self):
+        obj = {"data": {"itemType": "bookSection", "creators": [
+            {"creatorType": "editor", "firstName": "Ed", "lastName": "One"},
+            {"creatorType": "author", "firstName": "Ada", "lastName": "Author"},
+        ]}}
+        warnings = zpp.metadata_warnings(obj)
+        self.assertTrue(any("precede" in x for x in warnings))
+
+    def test_project_root_explicit_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            child = root / "a" / "b"
+            child.mkdir(parents=True)
+            (root / ".git").mkdir()
+            self.assertEqual(zpp.project_root(child), root.resolve())
+
+    def test_zpp_error_payload(self):
+        err = zpp.ZPPError("bad", code="example", hint="fix it")
+        self.assertEqual(err.as_dict(), {"type": "example", "message": "bad", "hint": "fix it"})
+
     def test_materialize_hardlink(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
