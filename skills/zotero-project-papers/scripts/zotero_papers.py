@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.2.0
+"""zotero-project-papers v0.2.1
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -38,6 +38,42 @@ DEFAULT_BIB_FILE = "papers/references.bib"
 MANIFEST_NAME = "papers.json"
 REFERENCE_CANDIDATES = ("reference", "references", "refs", "literature", "literatures", "papers/reference", "papers/references")
 AUTH_TIMEOUT = int(os.environ.get("ZPP_AUTH_TIMEOUT", "300"))
+
+# Creating items does not require /items/new. Zotero Local API implementations may
+# omit that Web-API convenience endpoint, so creation uses itemTypeFields when
+# available and falls back to conservative local field sets.
+COMMON_FALLBACK_FIELDS = {
+    "title", "abstractNote", "date", "shortTitle", "url", "accessDate",
+    "language", "rights", "extra", "DOI", "ISBN", "ISSN",
+}
+ITEM_TYPE_FALLBACK_FIELDS: dict[str, set[str]] = {
+    "journalArticle": COMMON_FALLBACK_FIELDS | {
+        "publicationTitle", "volume", "issue", "pages", "series",
+        "seriesTitle", "journalAbbreviation", "archive", "archiveLocation",
+        "libraryCatalog", "callNumber",
+    },
+    "conferencePaper": COMMON_FALLBACK_FIELDS | {
+        "proceedingsTitle", "conferenceName", "place", "publisher", "volume",
+        "pages", "series", "archive", "archiveLocation", "libraryCatalog",
+        "callNumber",
+    },
+    "preprint": COMMON_FALLBACK_FIELDS | {
+        "repository", "archiveID", "place", "type", "number",
+    },
+    "bookSection": COMMON_FALLBACK_FIELDS | {
+        "bookTitle", "series", "seriesNumber", "volume", "numberOfVolumes",
+        "edition", "place", "publisher", "pages",
+    },
+    "report": COMMON_FALLBACK_FIELDS | {
+        "reportNumber", "reportType", "institution", "place", "seriesTitle",
+    },
+    "thesis": COMMON_FALLBACK_FIELDS | {
+        "thesisType", "university", "place",
+    },
+    "webpage": COMMON_FALLBACK_FIELDS | {
+        "websiteTitle", "websiteType",
+    },
+}
 
 
 class ZPPError(RuntimeError):
@@ -1031,48 +1067,118 @@ def sync_project(client: ZoteroClient, root: Path, config: dict[str, Any], prune
     }
 
 
-def zotero_template(client: ZoteroClient, item_type: str) -> dict[str, Any]:
-    obj = client.read("items/new", {"itemType": item_type})
-    if not isinstance(obj, dict):
-        raise ZPPError(f"Could not get Zotero template for itemType={item_type}")
-    return obj
+def item_type_fields(client: ZoteroClient, item_type: str) -> tuple[set[str], str]:
+    """Return valid Zotero fields without depending on GET /items/new.
+
+    The local API documents item type/field endpoints, but older or partial
+    implementations may still omit them. In that case use a conservative
+    built-in set so common imports remain available.
+    """
+    try:
+        rows = client.read("itemTypeFields", {"itemType": item_type})
+        fields = {str(x.get("field")) for x in (rows or []) if isinstance(x, dict) and x.get("field")}
+        if fields:
+            return fields, "itemTypeFields"
+    except ZPPError:
+        pass
+    return set(ITEM_TYPE_FALLBACK_FIELDS.get(item_type, COMMON_FALLBACK_FIELDS)), "builtin-fallback"
 
 
 def build_item_from_metadata(client: ZoteroClient, metadata: dict[str, Any], collection_key: str) -> dict[str, Any]:
     item_type = str(metadata.get("itemType") or "journalArticle")
-    template = zotero_template(client, item_type)
-    allowed = set(template.keys())
-    item = dict(template)
+    allowed, _strategy = item_type_fields(client, item_type)
+    item: dict[str, Any] = {
+        "itemType": item_type,
+        "tags": metadata.get("tags") if isinstance(metadata.get("tags"), list) else [],
+        "collections": [collection_key],
+        "relations": metadata.get("relations") if isinstance(metadata.get("relations"), dict) else {},
+    }
+    if isinstance(metadata.get("creators"), list):
+        item["creators"] = metadata["creators"]
+    reserved = {"key", "version", "dateAdded", "dateModified", "parentItem", "linkMode", "filename", "contentType"}
     for key, value in metadata.items():
-        if key in allowed and key not in {"key", "version", "dateAdded", "dateModified", "parentItem", "linkMode"}:
+        if key in allowed and key not in reserved:
             item[key] = value
-    item["itemType"] = item_type
-    item["collections"] = [collection_key]
-    item.setdefault("tags", [])
-    item.setdefault("relations", {})
-    for k in ("key", "version", "dateAdded", "dateModified"):
-        item.pop(k, None)
     return item
 
 
-def create_imported_attachment(client: ZoteroClient, parent_key: str, pdf: Path) -> str:
-    template = zotero_template(client, "attachment")
-    item = dict(template)
-    item.update(
-        {
-            "itemType": "attachment",
-            "parentItem": parent_key,
-            "linkMode": "imported_file",
-            "title": pdf.stem,
-            "contentType": "application/pdf",
-            "filename": safe_filename(pdf.name),
-            "tags": [],
-            "relations": {},
-        }
-    )
-    for k in ("key", "version", "dateAdded", "dateModified", "md5", "mtime"):
-        item.pop(k, None)
-    return client.create_item(item)
+def canonical_pdf_filename(metadata: dict[str, Any], fallback_stem: str = "paper") -> str:
+    creators = [c for c in (metadata.get("creators") or []) if isinstance(c, dict)]
+    authors = [c for c in creators if c.get("creatorType") == "author"] or creators
+    author = "Unknown"
+    if authors:
+        c = authors[0]
+        author = str(c.get("lastName") or c.get("name") or c.get("firstName") or "Unknown").strip() or "Unknown"
+        if len(authors) > 1:
+            author += " et al."
+    date = str(metadata.get("date") or "")
+    m = re.search(r"(?:19|20)\d{2}", date)
+    year = m.group(0) if m else "n.d."
+    title = str(metadata.get("title") or fallback_stem).strip() or fallback_stem
+    return safe_filename(f"{author} - {year} - {title}.pdf")
+
+
+def create_imported_attachment(
+    client: ZoteroClient, parent_key: str, pdf: Path, metadata: dict[str, Any]
+) -> tuple[str, str]:
+    filename = canonical_pdf_filename(metadata, pdf.stem)
+    item = {
+        "itemType": "attachment",
+        "parentItem": parent_key,
+        "linkMode": "imported_file",
+        "title": Path(filename).stem,
+        "contentType": "application/pdf",
+        "filename": filename,
+        "tags": [],
+        "relations": {},
+    }
+    return client.create_item(item), filename
+
+
+def metadata_diff(existing_obj: dict[str, Any], incoming: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    existing = item_data(existing_obj)
+    interesting = {
+        "itemType", "title", "creators", "date", "DOI", "publicationTitle",
+        "proceedingsTitle", "conferenceName", "volume", "issue", "pages",
+        "publisher", "place", "ISBN", "ISSN", "url",
+    }
+    diff: dict[str, dict[str, Any]] = {}
+    for key in interesting:
+        if key not in incoming:
+            continue
+        new = incoming.get(key)
+        if new in (None, "", [], {}):
+            continue
+        old = existing.get(key)
+        if old != new:
+            diff[key] = {"existing": old, "incoming": new}
+    return diff
+
+
+def update_existing_metadata(
+    client: ZoteroClient, item_key: str, metadata: dict[str, Any]
+) -> dict[str, Any]:
+    obj = get_item(client, item_key)
+    d = item_data(obj)
+    old_type = str(d.get("itemType") or "")
+    new_type = str(metadata.get("itemType") or old_type)
+    if new_type != old_type:
+        raise ZPPError(
+            f"Existing item {item_key} is {old_type}, but incoming metadata is {new_type}.",
+            code="item_type_conflict",
+            hint="Change the item type in Zotero manually, or import as a new item after resolving the duplicate. The skill will not silently rewrite an existing item's type.",
+        )
+    allowed, _ = item_type_fields(client, old_type)
+    patch: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if key in allowed or key == "creators":
+            if value not in (None, "", [], {}):
+                patch[key] = value
+    if not patch:
+        return {"updated": False, "fields": []}
+    headers = {"If-Unmodified-Since-Version": str(d.get("version", 0))}
+    client.write("PATCH", f"users/0/items/{item_key}", json_body=patch, extra_headers=headers)
+    return {"updated": True, "fields": sorted(patch.keys())}
 
 
 def md5_file(path: Path) -> str:
@@ -1083,12 +1189,12 @@ def md5_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def upload_attachment_file(client: ZoteroClient, attachment_key: str, pdf: Path) -> None:
+def upload_attachment_file(client: ZoteroClient, attachment_key: str, pdf: Path, filename: str | None = None) -> None:
     md5 = md5_file(pdf)
     stat_result = pdf.stat()
     form = {
         "md5": md5,
-        "filename": safe_filename(pdf.name),
+        "filename": safe_filename(filename or pdf.name),
         "filesize": stat_result.st_size,
         "mtime": int(stat_result.st_mtime * 1000),
     }
@@ -1181,6 +1287,34 @@ def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
             "status": "authorized" if client.api_key else "not-authorized",
             "hint": None if client.api_key else "Run `authorize` when a write operation is needed, then choose Always Allow in Zotero.",
         })
+        try:
+            fields = client.read("itemTypeFields", {"itemType": "journalArticle"}) or []
+            checks.append({
+                "name": "item-schema",
+                "ok": bool(fields),
+                "strategy": "itemTypeFields" if fields else "builtin-fallback",
+                "hint": None if fields else "Dynamic item fields were unavailable; common imports will use the built-in conservative schema.",
+            })
+        except ZPPError as schema_exc:
+            checks.append({
+                "name": "item-schema",
+                "ok": True,
+                "strategy": "builtin-fallback",
+                "warning": schema_exc.as_dict(),
+                "hint": "The skill can still import common paper types using its built-in conservative schema.",
+            })
+        try:
+            client.read("items/new", {"itemType": "journalArticle"})
+            checks.append({"name": "items-new-template", "ok": True, "supported": True, "required": False})
+        except ZPPError as template_exc:
+            checks.append({
+                "name": "items-new-template",
+                "ok": True,
+                "supported": False,
+                "required": False,
+                "note": "This Zotero Local API does not expose /items/new. v0.2.1 does not depend on it.",
+                "detail": template_exc.as_dict(),
+            })
     except ZPPError as exc:
         checks.append({"name": "zotero-local-api", "ok": False, "error": exc.as_dict()})
 
@@ -1580,6 +1714,10 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
     if duplicates:
         duplicate = duplicates[0]
         key = item_summary(duplicate, brief=True)["key"]
+        duplicate_metadata_diff = metadata_diff(duplicate, metadata)
+        metadata_update = None
+        if getattr(args, "update_existing_metadata", False) and duplicate_metadata_diff:
+            metadata_update = update_existing_metadata(client, key, metadata)
         changed = add_item_to_collection(client, key, config["collectionKey"])
         absorbed = False
         available = [a for a in pdf_attachments(client, key) if a.get("path")]
@@ -1596,14 +1734,21 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
             "addedToCollection": changed,
             "absorbedLocalReference": absorbed,
             "paper": record,
+            "metadataDiff": duplicate_metadata_diff,
+            "metadataUpdate": metadata_update,
             "note": "A local duplicate was found; no new Zotero item or PDF was created.",
         }
+        if duplicate_metadata_diff and not getattr(args, "update_existing_metadata", False):
+            response.setdefault("warnings", []).append({
+                "type": "existing-metadata-diff",
+                "message": "The existing Zotero item differs from the incoming metadata. Review metadataDiff; rerun with --update-existing-metadata only if you want the skill to overwrite matching-type fields.",
+            })
         if len(duplicates) > 1:
-            response["warnings"] = [{
+            response.setdefault("warnings", []).append({
                 "type": "multiple-local-duplicates",
                 "message": "Multiple Zotero items match this DOI/title. One existing item was reused; consider cleaning duplicates in Zotero.",
                 "itemKeys": [item_summary(x, brief=True)["key"] for x in duplicates],
-            }]
+            })
         return response
 
     # Multi-write path: require a remembered key before mutating anything.
@@ -1612,8 +1757,8 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
     item_key = client.create_item(item)
     attachment_key: str | None = None
     try:
-        attachment_key = create_imported_attachment(client, item_key, pdf)
-        upload_attachment_file(client, attachment_key, pdf)
+        attachment_key, attachment_filename = create_imported_attachment(client, item_key, pdf, metadata)
+        upload_attachment_file(client, attachment_key, pdf, attachment_filename)
     except Exception as exc:
         raise ZPPError(
             f"Partial import: Zotero bibliographic item {item_key}"
@@ -1633,6 +1778,7 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
         "action": "imported",
         "itemKey": item_key,
         "attachmentKey": attachment_key,
+        "attachmentFilename": attachment_filename,
         "absorbedLocalReference": absorbed,
         "paper": record,
     }
@@ -1649,7 +1795,7 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.2.0")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.2.1")
     p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1736,6 +1882,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("import-pdf", help="Import a selected PDF + metadata JSON into Zotero and current project")
     s.add_argument("pdf")
     s.add_argument("--metadata", required=True, help="UTF-8 JSON with Zotero item metadata; title is required")
+    s.add_argument("--update-existing-metadata", action="store_true", help="If a duplicate item is reused, overwrite non-empty incoming metadata fields only when the item type already matches")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_import_pdf)
 

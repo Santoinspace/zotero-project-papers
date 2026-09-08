@@ -1,8 +1,8 @@
-# zotero-project-papers v0.2.0
+# zotero-project-papers v0.2.1
 
 Agent Skill + stdlib-only Python helper that makes Zotero the canonical paper library while exposing a configurable project-level paper working set to coding agents.
 
-## v0.2 highlights
+## v0.2.1 highlights
 
 - configurable `referenceDir`;
 - existing-reference-folder onboarding (`use-existing`, `separate`, `merge`);
@@ -13,6 +13,10 @@ Agent Skill + stdlib-only Python helper that makes Zotero the canonical paper li
 - `set-reference-dir` for later renaming/moving;
 - user-modified managed PDFs are preserved instead of overwritten;
 - v0.1 project configs migrate automatically to schema v2.
+- import no longer depends on Local API `/items/new`;
+- `itemTypeFields` dynamic schema with built-in fallback;
+- canonical metadata-derived PDF filenames for new imports;
+- duplicate metadata diffs and explicit same-type metadata repair;
 
 ## Requirements
 

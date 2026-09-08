@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+
+- Removed the hard dependency on `GET /api/items/new`, which is not exposed by some Zotero 10 Local API builds.
+- New bibliographic items now use `itemTypeFields` for dynamic field validation, with conservative built-in schemas as a fallback.
+- Stored PDF attachments are created from the documented minimal attachment payload and no longer require an attachment template endpoint.
+- `doctor` now reports Local API schema/template capabilities and explicitly marks `/items/new` as optional.
+- Newly imported PDFs use a canonical metadata-derived filename (`Author - Year - Title.pdf`) instead of inheriting temporary download names.
+- Reusing an existing Zotero item now reports `metadataDiff` when incoming metadata disagrees with the library item.
+- Added explicit `--update-existing-metadata` for same-item-type metadata repair; item-type changes remain protected and require user review.
+
+### Compatibility
+
+- Verified the fallback code path with unit tests that simulate a 404 for the template/schema convenience endpoints.
+
 ## 0.2.0
 
 ### Added

@@ -3,7 +3,7 @@ name: zotero-project-papers
 description: Use Zotero as the canonical local paper library for coding and research projects. Trigger when the user asks to search, find, read, compare, cite, review, implement, or write from research papers, literature, related work, prior work, or evidence. Search the current project's Zotero collection first, then the whole local Zotero library, and use web search only when local Zotero is insufficient. Keep papers actually used by the project in its Zotero collection and expose their Zotero-managed PDFs through a configurable project reference directory.
 compatibility: Requires Zotero 10+ running locally with local application communication enabled and Python 3.10+. Designed for coding agents that can run local Python scripts; web search is optional and supplied by the host agent.
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
 ---
 
 # Zotero Project Papers
@@ -18,6 +18,7 @@ The user should not need to think about Zotero attachment keys, `storage/XXXXXXX
 - Zotero Settings → Advanced → **Allow other applications on this computer to communicate with Zotero** is enabled.
 - Python 3.10+ is available.
 - The helper is stdlib-only.
+- Import does not require the optional Local API `GET /items/new` endpoint. The helper validates fields via `itemTypeFields` when available and falls back to conservative local schemas.
 
 Resolve `scripts/zotero_papers.py` relative to this `SKILL.md`, but **do not change the shell working directory to the skill directory**. Invoke the helper by absolute path while keeping the agent's current working directory at the user's project. If necessary pass `--project-root <path>` before the subcommand.
 
@@ -100,6 +101,8 @@ Start from the user's project directory:
 ```bash
 $ZPP doctor --json
 ```
+
+`doctor` also reports whether the running Zotero exposes dynamic item-schema and `/items/new` convenience endpoints. `/items/new` is informational only and is **not required** by this Skill.
 
 If uninitialized, normally call:
 
@@ -230,6 +233,16 @@ $ZPP import-pdf /path/to/paper.pdf --metadata /tmp/paper.json --json
 ```
 
 The helper checks DOI/title duplicates, imports through Zotero, creates a Zotero stored attachment, adds the item to the project collection, and materializes the canonical PDF into the configured project reference directory.
+
+New imports use a metadata-derived attachment filename (`FirstAuthor [et al.] - Year - Title.pdf`) rather than the temporary download filename.
+
+If a duplicate Zotero item is reused and `metadataDiff` is non-empty, surface that diff to the user/agent. Do **not** silently overwrite the Zotero item. If the item type already matches and the user explicitly wants the incoming metadata to repair Zotero, rerun:
+
+```bash
+$ZPP import-pdf /path/to/paper.pdf --metadata /tmp/paper.json --update-existing-metadata --json
+```
+
+If `itemType` differs (for example `journalArticle` vs `conferencePaper`), do not use the update flag as a workaround. Tell the user the item-type conflict should be reviewed/corrected in Zotero first.
 
 If the input PDF is already inside the configured reference directory, a successful import/reuse **absorbs that local-only file**: once Zotero owns a recoverable PDF, the local-only file is removed and recreated as the project view of the Zotero attachment. This is the preferred way to reconcile manually added PDFs.
 

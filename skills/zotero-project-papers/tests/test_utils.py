@@ -222,6 +222,111 @@ class UtilsTests(unittest.TestCase):
             self.assertEqual(ctx.exception.code, "onboarding_required")
             self.assertEqual(ctx.exception.details["candidates"][0]["path"], "references")
 
+    def test_build_item_does_not_require_items_new(self):
+        class FakeClient:
+            def read(self, path, params=None):
+                self.path = path
+                if path == "itemTypeFields":
+                    return [{"field": "title"}, {"field": "DOI"}, {"field": "publicationTitle"}]
+                raise AssertionError(path)
+        client = FakeClient()
+        item = zpp.build_item_from_metadata(client, {
+            "itemType": "journalArticle",
+            "title": "Paper",
+            "DOI": "10.1/test",
+            "publicationTitle": "Journal",
+            "creators": [{"creatorType": "author", "lastName": "Smith"}],
+            "notAField": "ignored",
+        }, "COLL0001")
+        self.assertEqual(client.path, "itemTypeFields")
+        self.assertEqual(item["title"], "Paper")
+        self.assertNotIn("notAField", item)
+        self.assertEqual(item["collections"], ["COLL0001"])
+
+    def test_item_type_fields_falls_back_when_schema_endpoint_missing(self):
+        class FakeClient:
+            def read(self, path, params=None):
+                raise zpp.ZPPError("missing", code="zotero_http_404")
+        fields, strategy = zpp.item_type_fields(FakeClient(), "conferencePaper")
+        self.assertEqual(strategy, "builtin-fallback")
+        self.assertIn("conferenceName", fields)
+        self.assertIn("DOI", fields)
+
+    def test_canonical_pdf_filename_uses_metadata(self):
+        name = zpp.canonical_pdf_filename({
+            "title": "A Better: Paper?",
+            "date": "2025-10-01",
+            "creators": [
+                {"creatorType": "author", "firstName": "Ada", "lastName": "Guo"},
+                {"creatorType": "author", "firstName": "Bo", "lastName": "Li"},
+            ],
+        })
+        self.assertEqual(name, "Guo et al. - 2025 - A Better_ Paper_.pdf")
+
+    def test_create_attachment_uses_canonical_name_without_template_endpoint(self):
+        class FakeClient:
+            def create_item(self, item):
+                self.item = item
+                return "ATTACH01"
+        client = FakeClient()
+        key, filename = zpp.create_imported_attachment(client, "PARENT01", Path("tmp.pdf"), {
+            "title": "Paper Title",
+            "date": "2026",
+            "creators": [{"creatorType": "author", "lastName": "Ding"}],
+        })
+        self.assertEqual(key, "ATTACH01")
+        self.assertEqual(filename, "Ding - 2026 - Paper Title.pdf")
+        self.assertEqual(client.item["filename"], filename)
+        self.assertEqual(client.item["linkMode"], "imported_file")
+
+    def test_metadata_diff_reports_item_type_mismatch(self):
+        existing = {"data": {"itemType": "journalArticle", "title": "Same", "creators": []}}
+        diff = zpp.metadata_diff(existing, {"itemType": "conferencePaper", "title": "Same"})
+        self.assertEqual(diff["itemType"]["existing"], "journalArticle")
+        self.assertEqual(diff["itemType"]["incoming"], "conferencePaper")
+
+    def test_update_existing_metadata_refuses_item_type_change(self):
+        class FakeClient:
+            pass
+        original = zpp.get_item
+        try:
+            zpp.get_item = lambda client, key: {"data": {
+                "key": key, "version": 1, "itemType": "journalArticle", "title": "Old"
+            }}
+            with self.assertRaises(zpp.ZPPError) as ctx:
+                zpp.update_existing_metadata(FakeClient(), "ITEM0001", {
+                    "itemType": "conferencePaper", "title": "New"
+                })
+        finally:
+            zpp.get_item = original
+        self.assertEqual(ctx.exception.code, "item_type_conflict")
+
+    def test_update_existing_metadata_same_type_patches_fields(self):
+        class FakeClient:
+            def read(self, path, params=None):
+                if path == "itemTypeFields":
+                    return [{"field": "title"}, {"field": "DOI"}]
+                raise AssertionError(path)
+            def write(self, method, path, **kwargs):
+                self.method = method
+                self.path = path
+                self.kwargs = kwargs
+        client = FakeClient()
+        original = zpp.get_item
+        try:
+            zpp.get_item = lambda client, key: {"data": {
+                "key": key, "version": 7, "itemType": "journalArticle", "title": "Old", "DOI": ""
+            }}
+            out = zpp.update_existing_metadata(client, "ITEM0001", {
+                "itemType": "journalArticle", "title": "New", "DOI": "10.1/x"
+            })
+        finally:
+            zpp.get_item = original
+        self.assertTrue(out["updated"])
+        self.assertEqual(client.method, "PATCH")
+        self.assertEqual(client.kwargs["json_body"], {"title": "New", "DOI": "10.1/x"})
+        self.assertEqual(client.kwargs["extra_headers"]["If-Unmodified-Since-Version"], "7")
+
 
 if __name__ == "__main__":
     unittest.main()

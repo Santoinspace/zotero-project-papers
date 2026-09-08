@@ -56,6 +56,9 @@ This means a paper that already exists in Zotero should normally never be downlo
 - Safe reconciliation when files were manually added, deleted, or replaced.
 - Hard links are preferred when Zotero and the project are on the same filesystem, avoiding duplicate PDF storage.
 - Imports selected PDFs through Zotero 10 instead of writing into `Zotero/storage` directly.
+- Does not depend on Zotero Local API `GET /items/new`; common Zotero 10 builds that omit that endpoint can still import papers.
+- Newly imported PDFs receive metadata-based names such as `Guo et al. - 2025 - Paper Title.pdf`.
+- When a duplicate Zotero item is reused, metadata conflicts are surfaced instead of silently ignored.
 - Generates an agent-friendly `papers.json` and project BibTeX.
 - Windows-safe UTF-8 CLI output and compact JSON errors.
 - No third-party Python dependencies.
@@ -322,4 +325,9 @@ MinerU and other advanced PDF parsing backends remain optional rather than manda
 
 ## Version
 
-Current release: **v0.2.0**
+Current release: **v0.2.1**
+
+## Duplicate metadata safety
+
+If a PDF/DOI/title matches an existing Zotero item, Zotero Project Papers reuses it. When the incoming metadata disagrees with the existing item, the agent should show the conflict rather than silently overwrite your library. Same-item-type fields can be explicitly repaired; item-type conflicts remain manual-review events.
+
