@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.2.1
+"""zotero-project-papers v0.3.0
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -14,11 +14,13 @@ import mimetypes
 import os
 import re
 import shutil
+import sqlite3
 import socket
 import stat
 import sys
 import tempfile
 import time
+from time import perf_counter
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,13 +33,15 @@ from typing import Any, Iterable
 APP_NAME = "Zotero Project Papers"
 BASE_URL = os.environ.get("ZOTERO_LOCAL_API", "http://127.0.0.1:23119/api/").rstrip("/") + "/"
 CONFIG_NAME = ".zotero-project.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_COLLECTION_ROOT = "Projects"
 DEFAULT_REFERENCE_DIR = "papers/reference"
 DEFAULT_BIB_FILE = "papers/references.bib"
 MANIFEST_NAME = "papers.json"
 REFERENCE_CANDIDATES = ("reference", "references", "refs", "literature", "literatures", "papers/reference", "papers/references")
 AUTH_TIMEOUT = int(os.environ.get("ZPP_AUTH_TIMEOUT", "300"))
+CACHE_TTL_SECONDS = int(os.environ.get("ZPP_CACHE_TTL", "60"))
+DEFAULT_SEARCH_LIMIT = 10
 
 # Creating items does not require /items/new. Zotero Local API implementations may
 # omit that Web-API convenience endpoint, so creation uses itemTypeFields when
@@ -129,6 +133,20 @@ def user_config_dir() -> Path:
     return Path(xdg) / "zotero-project-papers" if xdg else Path.home() / ".config" / "zotero-project-papers"
 
 
+def user_cache_dir() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "zotero-project-papers" / "cache"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "zotero-project-papers"
+
+
+def cache_db_path(server_id: str) -> Path:
+    # Server IDs are opaque. Hash them so cache paths stay portable and filesystem-safe.
+    partition = hashlib.sha256(server_id.encode("utf-8")).hexdigest()[:20]
+    return user_cache_dir() / partition / "library.sqlite3"
+
+
 def auth_path() -> Path:
     return user_config_dir() / "auth.json"
 
@@ -217,6 +235,10 @@ def default_sync_config() -> dict[str, Any]:
         "driftPolicy": "prompt",
         "acknowledgedFingerprint": None,
         "acknowledgedAt": None,
+        # v0.3 quick preflight markers. These avoid a Zotero round-trip when neither
+        # the project reference view nor the cached Zotero library version changed.
+        "quickFingerprint": None,
+        "lastFullClean": None,
     }
 
 
@@ -231,6 +253,7 @@ def normalize_project_config(config: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("manifestFile", (Path(out["referenceDir"]) / MANIFEST_NAME).as_posix())
     out.setdefault("bibFile", DEFAULT_BIB_FILE)
     out.setdefault("fallback", "copy")
+    out.setdefault("zoteroServerID", None)
     sync = default_sync_config()
     existing_sync = out.get("sync")
     if isinstance(existing_sync, dict):
@@ -556,6 +579,358 @@ class ZoteroClient:
             extra_headers={"Zotero-Write-Token": token},
         )
         return self._created_key(response)
+
+
+
+# ---------- Fast local metadata cache ----------
+
+
+def _cache_connect(server_id: str) -> sqlite3.Connection:
+    path = cache_db_path(server_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS items (
+            key TEXT PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 0,
+            item_type TEXT,
+            title TEXT,
+            creators_json TEXT,
+            creators_text TEXT,
+            date TEXT,
+            doi TEXT,
+            publication_title TEXT,
+            abstract_note TEXT,
+            tags_text TEXT,
+            collections_json TEXT,
+            url TEXT,
+            updated_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_items_doi ON items(doi);
+        CREATE INDEX IF NOT EXISTS idx_items_date ON items(date);
+        CREATE INDEX IF NOT EXISTS idx_items_title ON items(title);
+        """
+    )
+    return conn
+
+
+def _cache_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return str(row[0]) if row else default
+
+
+def _cache_set_meta(conn: sqlite3.Connection, key: str, value: Any) -> None:
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+
+
+def cache_status(server_id: str) -> dict[str, Any]:
+    path = cache_db_path(server_id)
+    if not path.exists():
+        return {"exists": False, "path": str(path), "libraryVersion": None, "ageSeconds": None, "itemCount": 0}
+    conn = _cache_connect(server_id)
+    try:
+        synced = _cache_meta(conn, "last_synced_epoch")
+        age = max(0.0, time.time() - float(synced)) if synced else None
+        count = int(conn.execute("SELECT COUNT(*) FROM items").fetchone()[0])
+        version = _cache_meta(conn, "library_version")
+        return {
+            "exists": True,
+            "path": str(path),
+            "libraryVersion": int(version) if version and version.isdigit() else None,
+            "ageSeconds": round(age, 3) if age is not None else None,
+            "itemCount": count,
+        }
+    finally:
+        conn.close()
+
+
+def _cache_upsert_item(conn: sqlite3.Connection, obj: dict[str, Any]) -> None:
+    d = item_data(obj)
+    key = str(d.get("key") or obj.get("key") or "")
+    if not key:
+        return
+    item_type = str(d.get("itemType") or "")
+    if item_type in {"attachment", "note", "annotation"} or d.get("deleted"):
+        conn.execute("DELETE FROM items WHERE key=?", (key,))
+        return
+    creators = [c for c in (d.get("creators") or []) if isinstance(c, dict)]
+    creator_names = [creator_name(c) for c in creators]
+    tags = [str(t.get("tag")) for t in (d.get("tags") or []) if isinstance(t, dict) and t.get("tag")]
+    collections = [str(x) for x in (d.get("collections") or []) if x]
+    conn.execute(
+        """
+        INSERT INTO items(
+            key,version,item_type,title,creators_json,creators_text,date,doi,
+            publication_title,abstract_note,tags_text,collections_json,url,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(key) DO UPDATE SET
+            version=excluded.version,item_type=excluded.item_type,title=excluded.title,
+            creators_json=excluded.creators_json,creators_text=excluded.creators_text,
+            date=excluded.date,doi=excluded.doi,publication_title=excluded.publication_title,
+            abstract_note=excluded.abstract_note,tags_text=excluded.tags_text,
+            collections_json=excluded.collections_json,url=excluded.url,updated_at=excluded.updated_at
+        """,
+        (
+            key,
+            int(d.get("version") or obj.get("version") or 0),
+            item_type,
+            str(d.get("title") or ""),
+            json.dumps(creators, ensure_ascii=False),
+            " | ".join(creator_names),
+            str(d.get("date") or ""),
+            normalize_doi(str(d.get("DOI") or "")),
+            str(d.get("publicationTitle") or d.get("proceedingsTitle") or d.get("conferenceName") or ""),
+            str(d.get("abstractNote") or ""),
+            " | ".join(tags),
+            json.dumps(collections, ensure_ascii=False),
+            str(d.get("url") or ""),
+            utc_now(),
+        ),
+    )
+
+
+def _raw_json_page(client: "ZoteroClient", path: str, params: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
+    result = client.read(path, params, raw=True)
+    assert isinstance(result, HTTPResult)
+    payload = result.json() if result.body else []
+    rows = [x for x in payload if isinstance(x, dict)] if isinstance(payload, list) else []
+    lmv = result.headers.get("Last-Modified-Version")
+    return rows, int(lmv) if lmv and str(lmv).isdigit() else None
+
+
+def refresh_metadata_cache(client: "ZoteroClient", *, force: bool = False, max_age: int = CACHE_TTL_SECONDS) -> dict[str, Any]:
+    """Refresh a compact top-level-item cache, using Zotero local versions after first build."""
+    if client.server_id is None:
+        client.bootstrap()
+    assert client.server_id is not None
+    conn = _cache_connect(client.server_id)
+    try:
+        last_epoch = _cache_meta(conn, "last_synced_epoch")
+        current_version = _cache_meta(conn, "library_version")
+        age = time.time() - float(last_epoch) if last_epoch else None
+        if not force and age is not None and age < max_age:
+            count = int(conn.execute("SELECT COUNT(*) FROM items").fetchone()[0])
+            return {
+                "refreshed": False,
+                "strategy": "fresh-cache",
+                "libraryVersion": int(current_version) if current_version and current_version.isdigit() else None,
+                "itemCount": count,
+                "ageSeconds": round(max(0.0, age), 3),
+            }
+
+        since = int(current_version) if current_version and current_version.isdigit() else None
+        strategy = "incremental" if since is not None else "full"
+        start = 0
+        page_size = 100
+        latest_version = since
+        changed = 0
+        while True:
+            params: dict[str, Any] = {"limit": page_size, "start": start, "includeTrashed": 1}
+            if since is not None:
+                params["since"] = since
+            rows, lmv = _raw_json_page(client, "users/0/items/top", params)
+            if lmv is not None:
+                latest_version = max(latest_version or 0, lmv)
+            for obj in rows:
+                _cache_upsert_item(conn, obj)
+                changed += 1
+            if len(rows) < page_size:
+                break
+            start += page_size
+
+        deleted_count = 0
+        if since is not None:
+            result = client.read("users/0/deleted", {"since": since}, raw=True)
+            assert isinstance(result, HTTPResult)
+            payload = result.json() if result.body else {}
+            if isinstance(payload, dict):
+                for key in payload.get("items", []) or []:
+                    conn.execute("DELETE FROM items WHERE key=?", (str(key),))
+                    deleted_count += 1
+            lmv = result.headers.get("Last-Modified-Version")
+            if lmv and str(lmv).isdigit():
+                latest_version = max(latest_version or 0, int(lmv))
+
+        _cache_set_meta(conn, "server_id", client.server_id)
+        if latest_version is not None:
+            _cache_set_meta(conn, "library_version", latest_version)
+        _cache_set_meta(conn, "last_synced_epoch", time.time())
+        _cache_set_meta(conn, "last_synced_at", utc_now())
+        conn.commit()
+        count = int(conn.execute("SELECT COUNT(*) FROM items").fetchone()[0])
+        return {
+            "refreshed": True,
+            "strategy": strategy,
+            "libraryVersion": latest_version,
+            "changedItems": changed,
+            "deletedItems": deleted_count,
+            "itemCount": count,
+            "ageSeconds": 0.0,
+        }
+    finally:
+        conn.close()
+
+
+def _query_tokens(query: str) -> list[str]:
+    return [x for x in re.findall(r"[\w.-]+", query.casefold(), flags=re.UNICODE) if len(x) > 1][:12]
+
+
+def _score_text_record(record: dict[str, Any], query: str) -> float:
+    phrase = query.casefold().strip()
+    tokens = _query_tokens(query)
+    title = str(record.get("title") or "").casefold()
+    creators = " ".join(str(x) for x in (record.get("creators") or [])).casefold()
+    date = str(record.get("date") or "").casefold()
+    doi = str(record.get("DOI") or record.get("doi") or "").casefold()
+    publication = str(record.get("publicationTitle") or record.get("publication_title") or "").casefold()
+    tags = str(record.get("tagsText") or record.get("tags_text") or "").casefold()
+    abstract = str(record.get("abstractNote") or record.get("abstract_note") or "").casefold()
+    if not tokens and not phrase:
+        return 0.0
+    score = 0.0
+    if phrase and phrase in title:
+        score += 120.0
+    elif phrase and phrase in publication:
+        score += 50.0
+    for t in tokens:
+        if t in title:
+            score += 20.0
+        if t in publication:
+            score += 10.0
+        if t in tags:
+            score += 9.0
+        if t in creators:
+            score += 5.0
+        if t in date:
+            score += 5.0
+        if t in doi:
+            score += 8.0
+        if t in abstract:
+            score += 2.0
+    return score
+
+
+def search_manifest(root: Path, config: dict[str, Any], query: str, limit: int) -> list[dict[str, Any]]:
+    manifest = load_old_manifest(root, config)
+    rows: list[tuple[float, dict[str, Any]]] = []
+    for p in manifest.get("papers", []) or []:
+        if not isinstance(p, dict):
+            continue
+        score = _score_text_record(p, query)
+        if score <= 0:
+            continue
+        summary = {
+            "key": p.get("itemKey"),
+            "itemType": p.get("itemType"),
+            "title": p.get("title", ""),
+            "creators": p.get("creators", []) or [],
+            "date": p.get("date", ""),
+            "DOI": p.get("DOI", ""),
+            "publicationTitle": p.get("publicationTitle", ""),
+            "projectPath": p.get("projectPath"),
+            "score": round(score, 2),
+        }
+        rows.append((score, summary))
+    rows.sort(key=lambda x: (-x[0], str(x[1].get("date") or ""), str(x[1].get("title") or "").casefold()))
+    return [x[1] for x in rows[:limit]]
+
+
+def search_metadata_cache(server_id: str, query: str, limit: int, *, collection_key: str | None = None, verbose: bool = False) -> list[dict[str, Any]]:
+    path = cache_db_path(server_id)
+    if not path.exists():
+        return []
+    conn = _cache_connect(server_id)
+    try:
+        tokens = _query_tokens(query)
+        if not tokens:
+            return []
+        cols = ["title", "creators_text", "date", "doi", "publication_title", "abstract_note", "tags_text"]
+        ors: list[str] = []
+        params: list[Any] = []
+        for token in tokens:
+            for col in cols:
+                ors.append(f"lower({col}) LIKE ?")
+                params.append(f"%{token}%")
+        where = "(" + " OR ".join(ors) + ")"
+        if collection_key:
+            where += " AND collections_json LIKE ?"
+            params.append(f'%"{collection_key}"%')
+        sql = f"SELECT * FROM items WHERE {where} LIMIT 300"
+        candidates = conn.execute(sql, params).fetchall()
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for row in candidates:
+            creators_detailed = json.loads(row["creators_json"] or "[]")
+            creators = [creator_name(c) for c in creators_detailed if isinstance(c, dict)]
+            record = {
+                "key": row["key"], "itemType": row["item_type"], "title": row["title"] or "",
+                "creators": creators, "date": row["date"] or "", "DOI": row["doi"] or "",
+                "publicationTitle": row["publication_title"] or "", "abstractNote": row["abstract_note"] or "",
+                "tagsText": row["tags_text"] or "", "collections": json.loads(row["collections_json"] or "[]"),
+                "url": row["url"] or "",
+            }
+            score = _score_text_record(record, query)
+            if score <= 0:
+                continue
+            out = {
+                "key": record["key"], "itemType": record["itemType"], "title": record["title"],
+                "creators": record["creators"], "date": record["date"], "DOI": record["DOI"],
+                "publicationTitle": record["publicationTitle"], "score": round(score, 2),
+            }
+            if verbose:
+                out.update({
+                    "abstractNote": record["abstractNote"],
+                    "tags": [x.strip() for x in str(record["tagsText"]).split("|") if x.strip()],
+                    "collections": record["collections"],
+                    "url": record["url"],
+                })
+            scored.append((score, out))
+        scored.sort(key=lambda x: (-x[0], str(x[1].get("date") or ""), str(x[1].get("title") or "").casefold()))
+        return [x[1] for x in scored[:limit]]
+    finally:
+        conn.close()
+
+
+def quick_project_marker(root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    """Cheap, no-Zotero marker for reference-view changes plus cached library version."""
+    ref_dir = root / config["referenceDir"]
+    pdfs: list[tuple[str, int, int]] = []
+    if ref_dir.exists():
+        for p in ref_dir.rglob("*.pdf"):
+            if not p.is_file():
+                continue
+            try:
+                st = p.stat()
+                pdfs.append((relpath_for_manifest(p, root), int(st.st_size), int(st.st_mtime_ns)))
+            except OSError:
+                continue
+    manifest = root / config["manifestFile"]
+    manifest_stat: tuple[int, int] | None = None
+    if manifest.exists():
+        try:
+            st = manifest.stat()
+            manifest_stat = (int(st.st_size), int(st.st_mtime_ns))
+        except OSError:
+            pass
+    server_id = config.get("zoteroServerID")
+    cstat = cache_status(str(server_id)) if server_id else {"libraryVersion": None}
+    payload = {
+        "manifest": manifest_stat,
+        "pdfs": sorted(pdfs),
+        "cachedLibraryVersion": cstat.get("libraryVersion"),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return {"fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(), **payload}
 
 
 # ---------- Zotero/project helpers ----------
@@ -1312,7 +1687,7 @@ def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
                 "ok": True,
                 "supported": False,
                 "required": False,
-                "note": "This Zotero Local API does not expose /items/new. v0.2.1 does not depend on it.",
+                "note": "This Zotero Local API does not expose /items/new. v0.3.0 does not depend on it.",
                 "detail": template_exc.as_dict(),
             })
     except ZPPError as exc:
@@ -1362,8 +1737,39 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args))
     assert config is not None
+
+    # v0.3 fast path: when local files/manifest and the cached Zotero library version
+    # are unchanged, reuse the last full consistency result without touching Zotero.
+    quick = quick_project_marker(root, config)
+    sync_cfg = config.get("sync") if isinstance(config.get("sync"), dict) else default_sync_config()
+    previous_quick = sync_cfg.get("quickFingerprint")
+    last_full_clean = sync_cfg.get("lastFullClean")
+    if not args.full and previous_quick == quick["fingerprint"] and last_full_clean is not None:
+        if bool(last_full_clean):
+            recommendation = "continue"
+            status = "clean"
+        elif sync_cfg.get("driftPolicy") == "continue":
+            recommendation = "continue-with-acknowledged-drift"
+            status = "diverged"
+        else:
+            recommendation = "ask-user"
+            status = "diverged"
+        return {
+            "ok": True,
+            "projectRoot": str(root),
+            "collection": config["collectionPath"],
+            "referenceDir": config["referenceDir"],
+            "status": status,
+            "recommendation": recommendation,
+            "checkMode": "quick-cache-hit",
+            "zoteroContacted": False,
+            "quick": quick,
+        }
+
     client = ZoteroClient()
     client.bootstrap()
+    if not config.get("zoteroServerID"):
+        config["zoteroServerID"] = client.server_id
     snapshot = consistency_snapshot(client, root, config)
     snapshot = persist_consistency_state(
         root,
@@ -1372,6 +1778,9 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
         acknowledge_continue=args.ack_continue,
         reset_policy=args.reset_policy,
     )
+    config["sync"]["quickFingerprint"] = quick["fingerprint"]
+    config["sync"]["lastFullClean"] = bool(snapshot["clean"])
+    save_project_config(root, config)
     if snapshot["clean"]:
         recommendation = "continue"
     elif snapshot["needsPrompt"]:
@@ -1385,6 +1794,9 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
         "referenceDir": config["referenceDir"],
         "status": "clean" if snapshot["clean"] else "diverged",
         "recommendation": recommendation,
+        "checkMode": "full" if args.full else "full-after-marker-change",
+        "zoteroContacted": True,
+        "quick": quick,
         "consistency": snapshot,
     }
 
@@ -1569,6 +1981,7 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
         "manifestFile": manifest_file,
         "bibFile": bib_file,
         "fallback": args.fallback,
+        "zoteroServerID": client.server_id,
         "sync": default_sync_config(),
     }
     (root / reference_dir).mkdir(parents=True, exist_ok=True)
@@ -1591,23 +2004,93 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
+    started = perf_counter()
     root, config = load_project(requested_project_root(args), required=args.scope == "project")
+
+    # Fastest path: current-project manifest. No Zotero process/API call at all.
+    if args.scope == "project" and config is not None and not args.fulltext:
+        local_hits = search_manifest(root, config, args.query, args.limit)
+        if local_hits:
+            return {
+                "scope": args.scope,
+                "query": args.query,
+                "count": len(local_hits),
+                "source": "project-manifest",
+                "zoteroContacted": False,
+                "webNeeded": False,
+                "latencyMs": round((perf_counter() - started) * 1000, 2),
+                "items": local_hits,
+                "warnings": [],
+            }
+
     client = ZoteroClient()
     client.bootstrap()
+    if config is not None and not config.get("zoteroServerID"):
+        config["zoteroServerID"] = client.server_id
+        save_project_config(root, config)
+    assert client.server_id is not None
 
-    def run(fulltext: bool) -> list[dict[str, Any]]:
+    cache_info = cache_status(client.server_id)
+    cache_error: str | None = None
+    cache_available = bool(cache_info.get("exists"))
+
+    # A prebuilt cache is refreshed incrementally. Do NOT build the entire library on the
+    # first search: first-use latency must stay lower than a web search. Full cache warmup
+    # is an explicit `cache --refresh` operation.
+    if not args.fulltext and cache_available:
+        try:
+            refresh_info = refresh_metadata_cache(
+                client,
+                force=args.refresh_cache,
+                max_age=0 if args.refresh_cache else CACHE_TTL_SECONDS,
+            )
+            cache_info = {**cache_status(client.server_id), **refresh_info}
+            collection_key = config["collectionKey"] if args.scope == "project" and config else None
+            cached = search_metadata_cache(
+                client.server_id,
+                args.query,
+                args.limit,
+                collection_key=collection_key,
+                verbose=args.verbose,
+            )
+            if cached:
+                return {
+                    "scope": args.scope,
+                    "query": args.query,
+                    "count": len(cached),
+                    "source": "zotero-metadata-cache",
+                    "searchMode": "cached-metadata",
+                    "zoteroContacted": True,
+                    "webNeeded": False,
+                    "cache": cache_info,
+                    "latencyMs": round((perf_counter() - started) * 1000, 2),
+                    "items": cached,
+                    "warnings": [],
+                }
+        except ZPPError as exc:
+            cache_error = str(exc)
+
+    def run_zotero(fulltext: bool) -> list[dict[str, Any]]:
         if args.scope == "project":
             assert config is not None
             return collection_items(client, config["collectionKey"], args.query, fulltext)
         return library_search(client, args.query, fulltext, args.limit)
 
-    used_fulltext = bool(args.fulltext)
-    rows = run(used_fulltext)
-    fallback_used = False
-    if not rows and not used_fulltext and not args.no_fulltext_fallback:
-        rows = run(True)
+    # When there is no cache, direct Local API metadata search is the fast path. It avoids
+    # a whole-library download and is still local-only. If it misses, fall back to Zotero's
+    # indexed `everything` search, which can match abstracts and PDF full text.
+    if args.fulltext:
+        rows = run_zotero(True)
         used_fulltext = True
-        fallback_used = True
+        source = "zotero-fulltext"
+    else:
+        rows = run_zotero(False)
+        used_fulltext = False
+        source = "zotero-direct-metadata"
+        if not rows and not args.no_fulltext_fallback:
+            rows = run_zotero(True)
+            used_fulltext = True
+            source = "zotero-fulltext"
 
     selected = rows[: args.limit]
     summaries = [item_summary(x, brief=not args.verbose) for x in selected]
@@ -1615,12 +2098,31 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
         "scope": args.scope,
         "query": args.query,
         "count": len(summaries),
+        "source": source,
         "searchMode": "everything" if used_fulltext else "titleCreatorYear",
-        "fulltextFallbackUsed": fallback_used,
+        "zoteroContacted": True,
+        "webNeeded": len(summaries) == 0,
+        "cache": cache_info,
+        "cacheError": cache_error,
+        "latencyMs": round((perf_counter() - started) * 1000, 2),
         "items": summaries,
         "warnings": duplicate_warnings(selected),
     }
 
+
+def cmd_cache(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args), required=False)
+    server_id = config.get("zoteroServerID") if config else None
+    if not args.refresh and server_id:
+        return {"ok": True, "serverID": server_id, "cache": cache_status(str(server_id)), "zoteroContacted": False}
+    client = ZoteroClient()
+    client.bootstrap()
+    assert client.server_id is not None
+    if config is not None and config.get("zoteroServerID") != client.server_id:
+        config["zoteroServerID"] = client.server_id
+        save_project_config(root, config)
+    info = refresh_metadata_cache(client, force=bool(args.refresh), max_age=0 if args.refresh else CACHE_TTL_SECONDS)
+    return {"ok": True, "serverID": client.server_id, "cache": {**cache_status(client.server_id), **info}, "zoteroContacted": True}
 
 def cmd_show(args: argparse.Namespace) -> dict[str, Any]:
     client = ZoteroClient()
@@ -1795,7 +2297,7 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.2.1")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.3.0")
     p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1807,9 +2309,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
 
-    s = sub.add_parser("check", help="Cheap consistency check for Zotero collection, manifest, and reference PDFs")
+    s = sub.add_parser("check", help="Cheap consistency preflight; contacts Zotero only when local/cache markers changed")
     s.add_argument("--ack-continue", action="store_true", help="Remember the current drift fingerprint and continue without prompting until it changes")
     s.add_argument("--reset-policy", action="store_true", help="Forget any remembered continue decision and prompt again while drift remains")
+    s.add_argument("--full", action="store_true", help="Force a full Zotero/manifest/reference consistency comparison")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_check)
 
@@ -1842,10 +2345,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--scope", choices=["project", "library"], default="project")
     s.add_argument("--fulltext", action="store_true", help="Start directly with Zotero quicksearch 'everything' mode")
     s.add_argument("--no-fulltext-fallback", action="store_true", help="Do not retry an empty metadata search with full-text/everything search")
-    s.add_argument("--verbose", action="store_true", help="Include abstract, tags, collections, and detailed creator metadata")
-    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--verbose", action="store_true", help="Include abstract/tags for cached results; use show for one-paper details")
+    s.add_argument("--refresh-cache", action="store_true", help="Force an incremental Zotero metadata-cache refresh before searching")
+    s.add_argument("--limit", type=int, default=DEFAULT_SEARCH_LIMIT)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("cache", help="Inspect or refresh the local Zotero metadata cache")
+    s.add_argument("--refresh", action="store_true", help="Refresh now; first refresh builds the cache, later refreshes use Zotero ?since= versions")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_cache)
 
     s = sub.add_parser("show", help="Show full metadata and attachments for one Zotero item")
     s.add_argument("item_key")

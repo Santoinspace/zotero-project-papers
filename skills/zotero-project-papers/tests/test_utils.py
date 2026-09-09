@@ -72,7 +72,7 @@ class UtilsTests(unittest.TestCase):
                 self.assertTrue(os.path.samefile(src, dst))
 
 
-    def test_config_v1_migrates_to_v2(self):
+    def test_config_v1_migrates_to_v3(self):
         cfg = zpp.normalize_project_config({
             "schemaVersion": 1,
             "collectionPath": "Projects/Test",
@@ -82,7 +82,7 @@ class UtilsTests(unittest.TestCase):
             "bibFile": "papers/references.bib",
             "fallback": "copy",
         })
-        self.assertEqual(cfg["schemaVersion"], 2)
+        self.assertEqual(cfg["schemaVersion"], 3)
         self.assertEqual(cfg["sync"]["driftPolicy"], "prompt")
 
     def test_detect_reference_dirs_with_subdirs(self):
@@ -327,6 +327,117 @@ class UtilsTests(unittest.TestCase):
         self.assertEqual(client.kwargs["json_body"], {"title": "New", "DOI": "10.1/x"})
         self.assertEqual(client.kwargs["extra_headers"]["If-Unmodified-Since-Version"], "7")
 
+
+
+    def test_manifest_search_is_local_fast_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ref = root / "refs"
+            ref.mkdir()
+            config = zpp.normalize_project_config({
+                "schemaVersion": 3,
+                "collectionPath": "Projects/Test",
+                "collectionKey": "COLL0001",
+                "referenceDir": "refs",
+                "manifestFile": "refs/papers.json",
+                "bibFile": "papers/references.bib",
+                "fallback": "copy",
+                "zoteroServerID": "SERVER1",
+            })
+            zpp.save_project_config(root, config)
+            zpp.json_dump({"papers": [{
+                "itemKey": "ITEM0001",
+                "itemType": "conferencePaper",
+                "title": "Fast Local Retrieval for Agents",
+                "creators": ["Ada Example"],
+                "date": "2026",
+                "DOI": "10.1/example",
+                "publicationTitle": "Example Conference",
+                "projectPath": "refs/paper.pdf",
+            }]}, ref / "papers.json")
+            args = type("Args", (), {
+                "project_root": str(root), "scope": "project", "query": "local retrieval",
+                "fulltext": False, "no_fulltext_fallback": False, "verbose": False,
+                "refresh_cache": False, "limit": 10,
+            })()
+            original = zpp.ZoteroClient
+            class BombClient:
+                def __init__(self, *a, **k):
+                    raise AssertionError("Zotero must not be contacted on project-manifest hit")
+            try:
+                zpp.ZoteroClient = BombClient
+                result = zpp.cmd_search(args)
+            finally:
+                zpp.ZoteroClient = original
+            self.assertEqual(result["source"], "project-manifest")
+            self.assertFalse(result["zoteroContacted"])
+            self.assertEqual(result["items"][0]["key"], "ITEM0001")
+
+    def test_metadata_cache_searches_abstract_without_returning_it_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg = os.environ.get("XDG_CACHE_HOME")
+            old_local = os.environ.get("LOCALAPPDATA")
+            os.environ["XDG_CACHE_HOME"] = td
+            os.environ["LOCALAPPDATA"] = td
+            try:
+                conn = zpp._cache_connect("SERVER-ABSTRACT")
+                zpp._cache_upsert_item(conn, {
+                    "key": "ITEM0002",
+                    "version": 1,
+                    "data": {
+                        "key": "ITEM0002", "version": 1, "itemType": "conferencePaper",
+                        "title": "A Generic Method", "creators": [{"creatorType": "author", "lastName": "Lee"}],
+                        "date": "2026", "abstractNote": "Evaluation includes the RareBench-X benchmark.",
+                        "collections": ["COLL0001"],
+                    },
+                })
+                conn.commit(); conn.close()
+                hits = zpp.search_metadata_cache("SERVER-ABSTRACT", "RareBench-X", 10)
+                self.assertEqual(hits[0]["key"], "ITEM0002")
+                self.assertNotIn("abstractNote", hits[0])
+            finally:
+                if old_xdg is None: os.environ.pop("XDG_CACHE_HOME", None)
+                else: os.environ["XDG_CACHE_HOME"] = old_xdg
+                if old_local is None: os.environ.pop("LOCALAPPDATA", None)
+                else: os.environ["LOCALAPPDATA"] = old_local
+
+    def test_metadata_cache_refresh_uses_since_after_first_build(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_xdg = os.environ.get("XDG_CACHE_HOME")
+            old_local = os.environ.get("LOCALAPPDATA")
+            os.environ["XDG_CACHE_HOME"] = td
+            os.environ["LOCALAPPDATA"] = td
+            class FakeClient:
+                server_id = "SERVER-SINCE"
+                def bootstrap(self):
+                    return None
+                def read(self, path, params=None, raw=False):
+                    params = params or {}
+                    if path == "users/0/items/top":
+                        if "since" not in params:
+                            body = [{"key":"A","version":7,"data":{"key":"A","version":7,"itemType":"journalArticle","title":"First","creators":[],"collections":[]}}]
+                            return zpp.HTTPResult(200, {"Last-Modified-Version":"7"}, __import__('json').dumps(body).encode())
+                        self.seen_since = params["since"]
+                        body = [{"key":"B","version":8,"data":{"key":"B","version":8,"itemType":"journalArticle","title":"Second","creators":[],"collections":[]}}]
+                        return zpp.HTTPResult(200, {"Last-Modified-Version":"8"}, __import__('json').dumps(body).encode())
+                    if path == "users/0/deleted":
+                        self.deleted_since = params["since"]
+                        return zpp.HTTPResult(200, {"Last-Modified-Version":"8"}, b'{"items":[]}')
+                    raise AssertionError(path)
+            try:
+                c = FakeClient()
+                first = zpp.refresh_metadata_cache(c, force=True, max_age=0)
+                self.assertEqual(first["strategy"], "full")
+                second = zpp.refresh_metadata_cache(c, force=True, max_age=0)
+                self.assertEqual(second["strategy"], "incremental")
+                self.assertEqual(c.seen_since, 7)
+                self.assertEqual(c.deleted_since, 7)
+                self.assertEqual(zpp.cache_status("SERVER-SINCE")["libraryVersion"], 8)
+            finally:
+                if old_xdg is None: os.environ.pop("XDG_CACHE_HOME", None)
+                else: os.environ["XDG_CACHE_HOME"] = old_xdg
+                if old_local is None: os.environ.pop("LOCALAPPDATA", None)
+                else: os.environ["LOCALAPPDATA"] = old_local
 
 if __name__ == "__main__":
     unittest.main()

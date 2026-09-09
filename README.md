@@ -1,10 +1,10 @@
 # Zotero Project Papers
 
-**Make your Zotero library project-aware and agent-ready.**
+**A Zotero-first paper workflow for Claude Code, Codex, and other coding agents — but only when you explicitly ask for papers.**
 
-Zotero Project Papers connects your local Zotero library with the research or coding project you are currently working on. Coding agents such as Claude Code and Codex can search Zotero before the web, reuse PDFs you already own, keep project-specific papers together, and import genuinely useful new papers back into Zotero without duplicating your library.
+Zotero Project Papers connects the research/coding project you are currently working on with your local Zotero library. When you explicitly ask an agent to find or reference academic papers, it checks your project and Zotero before going to the web, reuses PDFs you already have, and archives the papers actually used by the project.
 
-Zotero remains the place where **you** manage and read papers. Your project reference directory becomes the place where **the agent** can work with the papers relevant to that project.
+Zotero remains where **you** manage and read papers. Your project's reference directory is where **the agent** works with the papers relevant to that project.
 
 ```text
 Zotero library                  Current project
@@ -16,73 +16,117 @@ All of your papers              code/
                                  papers/references.bib
 ```
 
-For each project, the skill creates or reuses a matching Zotero collection under:
+## The most important behavior in v0.3
+
+This Skill is intentionally **not always-on**.
+
+It should activate when you explicitly say things like:
+
+> 请参考 2026 年的顶级会议论文，给我几个动机强、改动小、逻辑自洽的方向。
+
+> 从我的 Zotero 里查找相关论文，本地没有再上网搜。
+
+> Find recent ICLR/NeurIPS papers about this topic.
+
+> 根据当前项目 reference 里的论文写 related work。
+
+It should **not** activate just because a technical question could benefit from citations:
+
+> 这个思路从理论上成立吗？
+
+> 训练时这个模块应该怎么做？
+
+> 这种拒绝预测机制有什么影响？
+
+> 这个方向有人研究吗？
+
+In a mixed conversation, the Skill should wait until the user explicitly switches to paper/literature retrieval.
+
+## Why local-first should actually be fast
+
+v0.3 uses this search order:
 
 ```text
-Projects/
-└── <project-name>/
+1. Current-project papers.json
+   ↓ local JSON, no Zotero call
+2. Local Zotero metadata cache, if already warmed
+   ↓ compact SQLite + incremental refresh
+3. Direct Zotero Local API metadata search
+   ↓ localhost
+4. Zotero indexed full-text search
+   ↓ bounded fallback
+5. Web search
 ```
 
-## What it does
+The CLI reports `source`, `latencyMs`, `zoteroContacted`, and `webNeeded` so the fast path is observable.
 
-When you ask an agent to find, read, compare, cite, or design something from real papers, the Skill follows this workflow:
+Search output is brief by default and limited to 10 candidates. The agent should fetch details only for promising papers instead of dumping many abstracts into context.
 
-```text
-Current project papers
-        ↓
-Project Zotero collection
-        ↓
-Whole local Zotero library
-        ↓
-Web search only if needed
-        ↓
-Selected new papers → Zotero
-        ↓
-Project reference directory
+### Optional metadata-cache warmup
+
+The first search **does not build a full-library cache automatically**. That could make first use slower than simply querying Zotero.
+
+If you do many broad literature searches and want the fastest repeated local lookup, warm the cache once:
+
+```bash
+python scripts/zotero_papers.py cache --refresh --json
 ```
 
-This means a paper that already exists in Zotero should normally never be downloaded a second time.
+Later cache refreshes use Zotero's local object versions and `?since=<version>` to fetch only changes. Cache data is partitioned by `Zotero-Server-ID`.
+
+## Automatic evidence archiving
+
+A paper found during search is only a **candidate**.
+
+A paper becomes **project evidence** when the agent actually relies on it in the final analysis, design, comparison, implementation, or citation.
+
+For an explicit literature task, the Skill should automatically:
+
+- add Zotero-local evidence papers to the project's Zotero collection;
+- expose their Zotero-managed PDFs in the configured project reference directory;
+- import web-found papers actually used as evidence into Zotero when a reliable PDF is available;
+- avoid importing the rest of the search candidates.
+
+So a top-conference search might inspect 20 candidates but archive only the 5 papers actually used in the answer.
 
 ## Features
 
-- Zotero-first paper search for coding agents.
+- Narrow, explicit activation policy — no surprise literature searches during ordinary technical discussion.
+- Project manifest fast path with no Zotero API call on a hit.
+- Optional compact SQLite Zotero metadata cache.
+- Incremental cache updates using Zotero local library versions.
+- Direct Zotero metadata and indexed full-text fallback before web search.
 - One Zotero collection per project, e.g. `Projects/MyResearchProject`.
-- Configurable project reference directory — `papers/reference`, `references`, `literature`, or another relative path you prefer.
-- Detects existing reference/literature folders during first setup instead of silently creating a competing directory.
-- Can keep an existing directory, create a separate managed directory, or flatten existing PDFs into a new directory when you explicitly choose to merge.
-- Lightweight consistency check between Zotero, `papers.json`, and actual project PDFs.
-- Remembers when you choose to continue with a known mismatch, so the agent does not ask on every invocation.
-- Notices new drift later and asks again only when something actually changed.
-- Safe reconciliation when files were manually added, deleted, or replaced.
-- Hard links are preferred when Zotero and the project are on the same filesystem, avoiding duplicate PDF storage.
-- Imports selected PDFs through Zotero 10 instead of writing into `Zotero/storage` directly.
-- Does not depend on Zotero Local API `GET /items/new`; common Zotero 10 builds that omit that endpoint can still import papers.
-- Newly imported PDFs receive metadata-based names such as `Guo et al. - 2025 - Paper Title.pdf`.
-- When a duplicate Zotero item is reused, metadata conflicts are surfaced instead of silently ignored.
-- Generates an agent-friendly `papers.json` and project BibTeX.
-- Windows-safe UTF-8 CLI output and compact JSON errors.
+- Configurable project reference directory (`papers/reference`, `references`, `literature`, etc.).
+- Existing-reference-directory onboarding: use existing, keep separate, or explicitly flatten/merge PDFs.
+- Cheap consistency preflight that can reuse previous state without contacting Zotero.
+- Drift acknowledgement so the same mismatch does not repeatedly interrupt you.
+- Safe reconciliation for manually added/deleted/replaced PDFs.
+- Hard links when possible to avoid duplicate PDF storage.
+- New PDFs imported through Zotero 10 rather than copied into `Zotero/storage` manually.
+- `papers.json` and project BibTeX generation.
+- Compact machine-readable errors and Windows-safe UTF-8 output.
 - No third-party Python dependencies.
 
 ## Requirements
 
 - **Zotero 10+**
 - **Python 3.10+**
-- Zotero must be running while the Skill is used.
-- In Zotero: **Settings → Advanced → Allow other applications on this computer to communicate with Zotero**.
-- A coding agent capable of running local commands, such as Claude Code or Codex.
+- Zotero running while Zotero operations are needed
+- Zotero → **Settings → Advanced → Allow other applications on this computer to communicate with Zotero**
+- Claude Code, Codex, or another coding agent that can run local commands
 
 ## Install with CC Switch
 
-CC Switch is the recommended installer and updater.
+CC Switch is the recommended installer/updater.
 
-1. Open **CC Switch → Skills → Repository Management → Add Repository**.
-   GitHub repository: `Santoinspace/zotero-project-papers`
+1. Open **CC Switch → Skills → Repository Management → Add Repository**. `Santoinspace/zotero-project-papers`
 2. Add this GitHub repository.
 3. Use branch `main` and Skills path `skills`.
 4. Refresh the Skills list.
-5. Install **`zotero-project-papers`** and enable/sync it to Claude Code, Codex, or another supported agent.
+5. Install **`zotero-project-papers`** and sync it to Claude Code/Codex.
 
-After installation, let CC Switch manage updates. Do not keep permanent manual edits inside CC Switch's managed Skill directory because an update can replace them.
+Do not keep permanent edits inside CC Switch's managed Skill directory; updates can replace them.
 
 ## Quick start
 
@@ -93,151 +137,82 @@ cd my-research-project
 claude
 ```
 
-Then simply ask something like:
-
-> Find the most relevant papers about long-term memory for LLM agents. Check my Zotero library first, then use real papers to propose an experiment plan for this project.
-
-You normally do **not** need to run the helper commands yourself. The Skill handles them.
-
-## First use: your reference folder is your choice
-
-The default suggested working directory is:
-
-```text
-papers/reference/
-```
-
-but it is not mandatory. You can use:
-
-```text
-references/
-literature/
-papers/refs/
-```
-
-or another project-relative path.
-
-If the project already contains a likely reference directory, the Skill will not silently rearrange it. The agent should ask what you want to do.
-
-### Option 1 — use the existing directory
-
-Keep your current directory and subdirectory structure as-is.
+Then keep working normally. The Skill should remain inactive until you explicitly ask for papers.
 
 For example:
 
+> 请参考 2026 年顶级会议论文，给我几个适合当前项目的创新方向。
+
+At that point the intended flow is:
+
 ```text
-references/
-├── surveys/
-│   └── survey.pdf
-└── methods/
-    └── method.pdf
+project papers.json
+    ↓
+local Zotero
+    ↓
+Zotero full text if needed
+    ↓
+web only for missing coverage
+    ↓
+papers actually used as evidence
+    ↓
+Zotero project collection + project reference directory
 ```
 
-The Skill can use `references/` as the project working directory without flattening it automatically.
+## First use and reference directories
 
-### Option 2 — keep the old directory and create a new one
-
-Your existing directory is left untouched and Zotero Project Papers creates a separate working directory.
-
-### Option 3 — merge PDFs into a new directory
-
-If you explicitly choose merge, PDFs are discovered recursively and placed into one flat destination directory:
+The default suggested directory is:
 
 ```text
-old references/
-├── surveys/a.pdf
-└── methods/b.pdf
-
-        ↓ merge
-
 papers/reference/
-├── a.pdf
-└── b.pdf
 ```
 
-Only PDFs are merged. The original directory is preserved, non-PDF files are not moved, and filename collisions are renamed safely.
+but it is configurable. You can use `references/`, `literature/`, `papers/refs/`, or another project-relative path.
 
-## What happens when you manually edit the reference directory?
+If the project already contains a likely reference folder, the Skill should ask whether to:
 
-That is allowed.
+1. **Use the existing directory** and preserve its subdirectories.
+2. **Keep it separate** and create a new managed directory.
+3. **Merge PDFs** into a new flat directory. Only PDFs are flattened; the original directory is preserved and filename collisions are renamed safely.
 
-You may manually:
+## Manual edits are allowed
 
-- add a PDF;
-- delete a PDF;
-- replace a PDF;
-- change the corresponding Zotero project collection.
+You can manually add, remove, or replace PDFs in the reference directory.
 
-Before a project-scoped literature task, the Skill performs a cheap consistency check between:
+The Skill tracks drift between:
 
 ```text
 Zotero project collection
         ↕
 papers.json
         ↕
-actual reference PDFs
+actual project PDFs
 ```
 
-If everything matches, nothing is shown.
-
-If something changed, the agent can tell you, for example:
-
-```text
-Reference workspace changed:
-+ 2 local-only PDFs
-- 1 Zotero-managed PDF is missing locally
-
-Continue for now, or unify it with Zotero?
-```
-
-### If you choose “continue”
-
-The Skill remembers the exact current mismatch and continues working. It will not keep asking about the same state.
-
-If you later add/delete/change something else, the mismatch fingerprint changes and the agent can ask once again.
-
-### If you ask to “unify” later
-
-The Skill reconciles the project toward the Zotero project collection:
-
-- missing Zotero-managed project PDFs are restored;
-- stale generated metadata is refreshed;
-- manually added PDFs are reported rather than silently deleted;
-- wanted local-only PDFs can be imported into Zotero;
-- a manually replaced managed PDF is preserved instead of being overwritten.
-
-Once the project is clean again, the remembered “continue despite mismatch” state is reset automatically.
+If you choose “continue for now”, it remembers that exact mismatch and does not ask again until something changes. If you later ask the agent to “统一 / reconcile”, Zotero remains the canonical source for managed papers, while local-only/user-modified files are preserved unless you explicitly request deletion.
 
 ## Zotero remains the source of truth
 
-The project directory is a working view, not a second paper library.
+The Skill never writes directly to `zotero.sqlite` or fabricates folders inside `Zotero/storage`.
 
-The Skill never treats deleting a project PDF as permission to delete the Zotero item. It never writes directly to `zotero.sqlite` or fabricates folders inside `Zotero/storage`.
-
-For new papers:
+For new PDFs:
 
 ```text
-Web / local PDF
+Web/local PDF
       ↓
 Zotero Local API
       ↓
-Zotero-managed stored attachment
+Zotero-managed attachment
       ↓
-Project reference view
+project reference view
 ```
 
-## Avoiding duplicate PDF storage
+Deleting a project PDF never means “delete this paper from my Zotero library”.
 
-When possible, the project PDF is a **hard link** to the Zotero-managed PDF. To you, VS Code, Claude Code, and Codex it behaves like a normal PDF, while the filesystem stores one underlying file.
-
-Hard links require Zotero and the project directory to be on the same filesystem/volume. If that is not possible, the default fallback is a normal copy; symbolic-link fallback can also be configured.
-
-## Project files
-
-A typical initialized project may look like:
+## Typical project layout
 
 ```text
-my-research-project/
+my-project/
 ├── .zotero-project.json
 ├── src/
 ├── experiments/
@@ -250,84 +225,38 @@ my-research-project/
     └── references.bib
 ```
 
-If you chose another reference directory, that path is recorded in `.zotero-project.json` and the Skill uses it instead of assuming `papers/reference`.
-
-Zotero gets a matching collection such as:
+Zotero gets a matching collection:
 
 ```text
 Projects/
-└── my-research-project/
+└── my-project/
 ```
 
-## Example prompts
+## Useful manual/debug commands
 
-> Find papers about KV-cache compression. Search my Zotero library before the web.
+Normal users should rarely need these; agents invoke them automatically.
 
-> Read the FlashAttention paper and compare it with the attention implementation in this repository.
+```bash
+# Fast consistency preflight
+python scripts/zotero_papers.py check --json
 
-> Look for real papers related to this idea and propose a benchmark grounded in their methods and limitations.
+# Force full consistency comparison
+python scripts/zotero_papers.py check --full --json
 
-> I manually added a few PDFs to the references folder. Help me unify them with Zotero.
+# Search current project
+python scripts/zotero_papers.py search "query" --scope project --json
 
-> Rename this project's paper directory to `literature` and keep the Zotero collection in sync.
+# Search whole local Zotero library
+python scripts/zotero_papers.py search "query" --scope library --json
 
-> Use the papers relevant to this project to help structure the related-work section and update the BibTeX references.
+# Optional one-time cache warmup
+python scripts/zotero_papers.py cache --refresh --json
+```
 
-## Local search behavior
+## Privacy of activation regression tests
 
-Searches return compact metadata by default to save agent context. If title/author/year search returns no result, the helper automatically retries Zotero's broader `everything` search, allowing dataset names, acronyms, benchmark names, or terms present only in abstracts/indexed PDF text to match.
+The repository includes a small activation regression fixture based on a real interaction pattern. It is **synthetic and privacy-sanitized**: it preserves only the conversational structure “technical discussion → explicit request for top-conference papers”. It contains no source project names, model names, dataset names, paper titles, URLs, paths, or experimental metrics.
 
-The Skill can then request full metadata or the actual PDF only for promising candidates.
+## Project status
 
-## Safety behavior
-
-- No direct writes to `Zotero/storage`.
-- No direct writes to `zotero.sqlite`.
-- No automatic deletion of Zotero library items.
-- Manually modified project PDFs are not silently overwritten.
-- `sync --prune` skips a formerly managed file if its content appears to have been replaced by the user.
-- Local-only PDFs are not deleted during reconciliation unless the user explicitly asks for that destructive action.
-- Duplicate DOI/title and suspicious creator-role metadata are surfaced as warnings.
-
-## Troubleshooting
-
-### Zotero cannot be reached
-
-Make sure Zotero 10+ is running and local application communication is enabled.
-
-### Zotero asks for permission
-
-On the first write operation, Zotero may show an authorization dialog. Choose **Always Allow** for the smoothest experience. The helper waits up to five minutes for the human action.
-
-### The wrong project root is detected
-
-The agent should keep its shell working directory inside the intended repository. It can also pass an explicit `--project-root` to the helper.
-
-### The project and Zotero disagree
-
-Ask the agent:
-
-> Check my project papers and tell me what is out of sync.
-
-or:
-
-> Unify this project's reference directory with Zotero.
-
-## Current scope
-
-Zotero Project Papers deliberately stays small:
-
-- Zotero manages the library and human reading experience.
-- The host agent provides web search.
-- The Skill provides Zotero-first lookup, project membership, local paper views, consistency checks, reconciliation, and import orchestration.
-
-MinerU and other advanced PDF parsing backends remain optional rather than mandatory dependencies.
-
-## Version
-
-Current release: **v0.2.1**
-
-## Duplicate metadata safety
-
-If a PDF/DOI/title matches an existing Zotero item, Zotero Project Papers reuses it. When the incoming metadata disagrees with the existing item, the agent should show the conflict rather than silently overwrite your library. Same-item-type fields can be explicitly repaired; item-type conflicts remain manual-review events.
-
+This is an early-stage open-source project being tested on real research workflows. Bug reports and workflow feedback are welcome, especially around Zotero Local API compatibility, paper deduplication, metadata quality, and agent activation behavior.

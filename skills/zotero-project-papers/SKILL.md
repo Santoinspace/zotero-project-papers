@@ -1,16 +1,69 @@
 ---
 name: zotero-project-papers
-description: Use Zotero as the canonical local paper library for coding and research projects. Trigger when the user asks to search, find, read, compare, cite, review, implement, or write from research papers, literature, related work, prior work, or evidence. Search the current project's Zotero collection first, then the whole local Zotero library, and use web search only when local Zotero is insufficient. Keep papers actually used by the project in its Zotero collection and expose their Zotero-managed PDFs through a configurable project reference directory.
-compatibility: Requires Zotero 10+ running locally with local application communication enabled and Python 3.10+. Designed for coding agents that can run local Python scripts; web search is optional and supplied by the host agent.
+description: Use only when the user explicitly asks to find, search, survey, retrieve, or reference academic papers/literature; explicitly asks for top-conference/top-journal papers; explicitly asks to use Zotero or the project's reference papers; or explicitly asks for an answer grounded in actual papers. Do not activate merely because a technical question could benefit from citations, because the user asks whether something "has been studied", or for ordinary design/coding discussion without an explicit literature-retrieval request. When activated, search the current project and local Zotero first, use web only as needed, and archive papers actually used as evidence into Zotero and the project reference set.
+compatibility: Requires Zotero 10+ running locally with local application communication enabled and Python 3.10+. Designed for coding agents that can run local Python scripts; web search is supplied by the host agent.
 metadata:
-  version: "0.2.1"
+  version: "0.3.0"
 ---
 
 # Zotero Project Papers
 
-Use Zotero as the long-term source of truth and the current repository's configured reference directory as the agent-facing paper working set.
+Zotero is the long-term paper library. The current project's configurable reference directory is the agent-facing working set.
 
-The user should not need to think about Zotero attachment keys, `storage/XXXXXXXX`, hard links, or API calls. Handle those through `scripts/zotero_papers.py`.
+The user should not need to think about Zotero attachment keys, `storage/XXXXXXXX`, hard links, Local API details, or cache files. Handle those through `scripts/zotero_papers.py`.
+
+## Activation policy — intentionally narrow
+
+**Do not run any helper command merely because research literature might be useful.** This skill is deliberately opt-in by user intent.
+
+Activate only when the user explicitly requests at least one of the following:
+
+- find/search/retrieve papers or references;
+- survey/review academic literature or related work;
+- reference papers from a named year, venue tier, conference, or journal;
+- use the user's Zotero library or the current project's reference papers;
+- answer/design/compare **based on actual papers**, **based on top-conference papers**, or equivalent explicit evidence-grounding language;
+- read or cite a specifically identified paper.
+
+Typical positive triggers:
+
+- “请查找 2026 年顶级会议论文，再给我几个方案。”
+- “从 Zotero 里找和这个方法有关的论文。”
+- “根据本项目 reference 里的论文写 related work。”
+- “Find recent NeurIPS/ICLR papers on this topic.”
+- “Use actual papers as evidence for the design.”
+
+Do **not** activate for requests such as:
+
+- “这个思路从理论上成立吗？”
+- “这个模块应该怎么训练？”
+- “这种拒绝预测机制会有什么影响？”
+- “这个方案有什么问题？”
+- “这个方向有人研究吗？” when the user did not explicitly ask to search/retrieve literature.
+
+For mixed conversations, activate **only at the turn where the user explicitly switches to literature retrieval**. Earlier technical discussion does not retroactively justify running this skill.
+
+A privacy-sanitized activation regression set lives in `tests/activation_cases.json`.
+
+## Performance contract
+
+Local-first is useful only if it is faster and cheaper than web search. Follow this order and stop as soon as enough evidence is found:
+
+1. Current project `papers.json` manifest — local JSON, no Zotero call.
+2. Local Zotero metadata cache if it already exists — compact SQLite, incrementally refreshed with Zotero local versions.
+3. Direct Zotero Local API metadata search — no network.
+4. Zotero indexed `everything`/full-text search — bounded fallback.
+5. Host agent web search — only for missing or insufficient literature.
+
+Search results are brief by default. Do not request abstracts/full metadata for every candidate. Default result limit is 10; normally inspect details for only the top 3–5 promising papers.
+
+Never dump many abstracts or full texts into context just to rank candidates. Use:
+
+```bash
+$ZPP show ITEM_KEY --json
+```
+
+only after selecting a likely candidate, and read the PDF/full text only for papers actually needed.
 
 ## Requirements
 
@@ -18,9 +71,9 @@ The user should not need to think about Zotero attachment keys, `storage/XXXXXXX
 - Zotero Settings → Advanced → **Allow other applications on this computer to communicate with Zotero** is enabled.
 - Python 3.10+ is available.
 - The helper is stdlib-only.
-- Import does not require the optional Local API `GET /items/new` endpoint. The helper validates fields via `itemTypeFields` when available and falls back to conservative local schemas.
+- Import does not require `GET /items/new`.
 
-Resolve `scripts/zotero_papers.py` relative to this `SKILL.md`, but **do not change the shell working directory to the skill directory**. Invoke the helper by absolute path while keeping the agent's current working directory at the user's project. If necessary pass `--project-root <path>` before the subcommand.
+Resolve `scripts/zotero_papers.py` relative to this `SKILL.md`, but **keep the shell working directory at the user's project**. Invoke the helper by absolute path. If necessary pass `--project-root <path>` before the subcommand.
 
 In examples below, `$ZPP` means:
 
@@ -28,284 +81,233 @@ In examples below, `$ZPP` means:
 python <this-skill-directory>/scripts/zotero_papers.py
 ```
 
-When CC Switch manages the skill, do not self-install or edit the managed installed copy. Updates may replace local edits.
+When CC Switch manages the skill, never self-install or edit the managed installed copy.
 
-## Core invariant
+# Fast preflight
 
-Always use this order for literature-grounded work:
-
-1. Current project Zotero collection / configured reference directory.
-2. Whole local Zotero library.
-3. Web search only if local Zotero is insufficient.
-4. Import only papers actually selected for reading, citation, comparison, implementation, or design.
-5. Once a paper is used by the project, put the Zotero item in the project collection and materialize its Zotero-managed PDF into the configured reference directory.
-6. Read/analyze from the local project PDF when available.
-
-Never write directly into `Zotero/storage` or `zotero.sqlite`. New PDFs must be imported through Zotero 10's Local API. Never delete a Zotero library item merely because a project file was removed.
-
-## When to trigger
-
-Use this skill for requests such as:
-
-- find/search papers or references;
-- literature review / related work / prior work / state of the art;
-- read, summarize, compare, or critique papers;
-- "has anyone done this before?";
-- "design X based on actual papers/evidence";
-- implement or reproduce a method from a paper;
-- find BibTeX/citations for the current project;
-- write a literature-grounded introduction, rationale, or related-work section.
-
-Do not trigger for ordinary coding that does not benefit from research literature.
-
-# Required preflight behavior
-
-For a project-scoped literature task, use this lightweight sequence:
-
-1. If the project is not initialized, run `doctor --json`, then initialize as described below.
-2. Once initialized, run **one cheap consistency check before doing the literature task**:
+Only after the activation policy is satisfied, perform one consistency preflight:
 
 ```bash
 $ZPP check --json
 ```
 
-The check compares:
+In v0.3 this is normally a **quick marker check**. If the project files and cached Zotero library version are unchanged since the last full check, it returns without contacting Zotero.
 
-- Zotero project collection item keys;
-- generated `papers.json` records;
-- actual PDFs in the configured reference directory;
-- whether formerly managed project PDFs are missing or have been manually replaced.
+Interpret:
 
-It does **not** parse or hash every PDF, so it is intended to be cheap enough to run at skill entry.
+- `status=clean` → continue.
+- `status=diverged`, `recommendation=continue-with-acknowledged-drift` → continue silently.
+- `status=diverged`, `recommendation=ask-user` → briefly ask whether to continue for now or unify with Zotero.
 
-Interpret the result:
-
-- `status=clean` → continue normally.
-- `status=diverged` and `recommendation=continue-with-acknowledged-drift` → continue silently. The user already chose to tolerate this exact drift.
-- `status=diverged` and `recommendation=ask-user` → tell the user briefly what changed and ask whether to **continue for now** or **unify with Zotero**.
-
-If the user chooses **continue**, remember that exact drift fingerprint:
+If the user chooses continue:
 
 ```bash
 $ZPP check --ack-continue --json
 ```
 
-Do not ask again while the drift fingerprint is unchanged. If files/collection membership change again, the fingerprint changes and the next check should ask once again.
+Do not ask again while the drift fingerprint is unchanged.
 
-If the user later says "统一 / sync it / reconcile / clean up the references", reset that remembered choice by running the reconciliation workflow below. A clean state automatically resets the policy back to normal prompting for future drift.
-
-# First use and existing reference directories
-
-Start from the user's project directory:
+Use a forced full comparison only when needed:
 
 ```bash
-$ZPP doctor --json
+$ZPP check --full --json
 ```
 
-`doctor` also reports whether the running Zotero exposes dynamic item-schema and `/items/new` convenience endpoints. `/items/new` is informational only and is **not required** by this Skill.
-
-If uninitialized, normally call:
-
-```bash
-$ZPP init --json
-```
-
-If the helper detects an existing likely reference directory, it returns `onboarding_required` with candidate directories. **Do not silently create another directory or flatten the user's existing tree.** Ask the user to choose one of these modes:
-
-### A. Use the existing directory
-
-Preserve the existing directory and its subdirectories as-is:
-
-```bash
-$ZPP init --onboarding use-existing --existing-dir references --json
-```
-
-Existing PDFs are treated as local-only until they are matched/imported into Zotero. Do not rearrange them automatically.
-
-### B. Keep the existing directory separate
-
-Leave the old directory untouched and create a new managed working set. The user may choose any relative name/path:
-
-```bash
-$ZPP init --onboarding separate --reference-dir papers/reference --json
-```
-
-For a user preference such as `literature/`:
-
-```bash
-$ZPP init --onboarding separate --reference-dir literature --json
-```
-
-### C. Merge PDFs into a new directory
-
-If the user explicitly chooses merge, flatten only PDFs from the selected existing directory into the new directory:
-
-```bash
-$ZPP init --onboarding merge --existing-dir references --reference-dir papers/reference --json
-```
-
-Important merge semantics:
-
-- recurse through existing subdirectories;
-- put PDFs into one flat destination directory;
-- preserve the original source directory;
-- use hard links where possible, otherwise configured fallback;
-- rename filename collisions safely;
-- do not move notes, images, or non-PDF files;
-- merged PDFs initially remain local-only until reconciled/imported into Zotero.
-
-If more than one candidate directory exists, identify the intended source with `--existing-dir`.
-
-## Changing the reference directory later
-
-The reference directory is configurable and stored in `.zotero-project.json`; never assume it is `papers/reference` after initialization.
-
-If the user asks to rename/move it:
-
-```bash
-$ZPP set-reference-dir literature --json
-```
-
-This rematerializes Zotero-managed PDFs into the new directory and removes only old helper-managed files. It preserves unrelated/user-managed files. If the target already contains PDFs, ask the user first; after explicit confirmation use:
-
-```bash
-$ZPP set-reference-dir literature --allow-existing-target --json
-```
-
-Use `--keep-old` only when the user explicitly wants old managed links/copies retained too.
+Do not run `doctor`, `status`, `cache --refresh`, or a full consistency scan opportunistically on unrelated turns.
 
 # Search workflow
 
-## A. Search the current project first
+## 1. Search current project first
 
 ```bash
 $ZPP search "QUERY" --scope project --json
 ```
 
-Search output is brief by default. If metadata search returns zero results, the helper automatically retries Zotero's broader `everything` search so terms found only in abstracts/indexed PDF text can still match.
+If `source=project-manifest`, the result came from local `papers.json` and Zotero was not contacted.
 
-For details:
+If enough relevant papers are already in the project, stop searching and use them.
 
-```bash
-$ZPP show ITEM_KEY --json
-```
+## 2. Search whole local Zotero library
 
-Resolve local PDF paths:
-
-```bash
-$ZPP resolve ITEM_KEY --json
-```
-
-## B. Search the full local Zotero library
-
-If project search is insufficient:
+If project results are insufficient:
 
 ```bash
 $ZPP search "QUERY" --scope library --json
 ```
 
-For dataset names, acronyms, benchmark names, method nicknames, or queries likely to occur only in abstract/full text:
+Possible sources:
+
+- `zotero-metadata-cache`: compact local cache;
+- `zotero-direct-metadata`: direct localhost metadata search;
+- `zotero-fulltext`: Zotero indexed full-text fallback.
+
+The response includes `latencyMs`, `zoteroContacted`, and `webNeeded` so agent behavior can be audited.
+
+For a term known to occur mainly inside PDFs:
 
 ```bash
 $ZPP search "QUERY" --scope library --fulltext --json
 ```
 
-If a local paper becomes relevant to the project:
+Keep `--limit` small. Do not use `--verbose` unless metadata details are actually needed.
+
+### Optional cache warmup
+
+The first search deliberately does **not** download the whole Zotero library just to build a cache. If the user wants faster repeated broad searches, explicitly warm it once:
+
+```bash
+$ZPP cache --refresh --json
+```
+
+Subsequent refreshes use Zotero's local object versions and `?since=<version>` to fetch only changes. Cache partitions are isolated by `Zotero-Server-ID`.
+
+Do not warm the cache automatically merely because the skill triggered.
+
+## 3. Web fallback
+
+Use host-agent web search only when local results are absent or insufficient for the explicit request.
+
+For requests such as “参考 2026 年顶会论文”, local hits may be useful but web search can still be necessary to verify coverage/freshness. Do not skip web merely because one older local paper matched.
+
+Before downloading a selected web paper, perform a final local Zotero duplicate check by title/DOI/arXiv when practical.
+
+# Evidence-set persistence — automatic after explicit literature retrieval
+
+A search candidate is not automatically library material.
+
+A paper becomes **project evidence** when the agent actually relies on it in the final analysis, comparison, design, implementation, or citation.
+
+Before finalizing an explicitly literature-grounded answer:
+
+- for a paper already in Zotero, automatically run:
 
 ```bash
 $ZPP add ITEM_KEY --json
 ```
 
-Do not download it again.
-
-## C. Web fallback
-
-Only after local Zotero search is insufficient, use the host agent's web capability.
-
-Do not import every candidate. Select papers first. Before downloading a selected paper, perform a final Zotero duplicate check by exact title and DOI/arXiv when available.
-
-# Importing web-found or local-only PDFs
-
-Build a UTF-8 metadata JSON containing at least a title, then:
+- for a selected web paper that is actually used as evidence, download a legitimate/reliable PDF when available, build metadata JSON, and run:
 
 ```bash
 $ZPP import-pdf /path/to/paper.pdf --metadata /tmp/paper.json --json
 ```
 
-The helper checks DOI/title duplicates, imports through Zotero, creates a Zotero stored attachment, adds the item to the project collection, and materializes the canonical PDF into the configured project reference directory.
+This should happen automatically after the user explicitly asked for literature retrieval; do not make the user separately say “add these papers to Zotero”.
 
-New imports use a metadata-derived attachment filename (`FirstAuthor [et al.] - Year - Title.pdf`) rather than the temporary download filename.
+Do **not** import every search result. Persist only papers actually used as evidence or explicitly requested by the user.
 
-If a duplicate Zotero item is reused and `metadataDiff` is non-empty, surface that diff to the user/agent. Do **not** silently overwrite the Zotero item. If the item type already matches and the user explicitly wants the incoming metadata to repair Zotero, rerun:
+If a selected paper cannot be legally/reliably downloaded, do not block the answer; report that it could not be archived automatically.
+
+# First use and project binding
+
+From the user's project directory:
 
 ```bash
-$ZPP import-pdf /path/to/paper.pdf --metadata /tmp/paper.json --update-existing-metadata --json
+$ZPP doctor --json
 ```
 
-If `itemType` differs (for example `journalArticle` vs `conferencePaper`), do not use the update flag as a workaround. Tell the user the item-type conflict should be reviewed/corrected in Zotero first.
+If uninitialized:
 
-If the input PDF is already inside the configured reference directory, a successful import/reuse **absorbs that local-only file**: once Zotero owns a recoverable PDF, the local-only file is removed and recreated as the project view of the Zotero attachment. This is the preferred way to reconcile manually added PDFs.
+```bash
+$ZPP init --json
+```
+
+If an existing reference/literature directory is detected, do not silently create another directory. Ask the user to choose:
+
+### Use the existing directory
+
+```bash
+$ZPP init --onboarding use-existing --existing-dir references --json
+```
+
+Preserve its subdirectories. Existing PDFs remain local-only until reconciled/imported.
+
+### Keep it separate
+
+```bash
+$ZPP init --onboarding separate --reference-dir papers/reference --json
+```
+
+The user may choose another relative path such as `literature/`.
+
+### Merge PDFs into a new flat directory
+
+```bash
+$ZPP init --onboarding merge --existing-dir references --reference-dir papers/reference --json
+```
+
+Merge semantics:
+
+- recurse through existing subdirectories;
+- flatten PDFs only;
+- preserve the original source directory;
+- safely rename filename collisions;
+- do not move notes/images/non-PDF files;
+- merged PDFs remain local-only until reconciled/imported.
+
+# Changing the reference directory
+
+```bash
+$ZPP set-reference-dir literature --json
+```
+
+If the target already contains PDFs, ask the user before using:
+
+```bash
+$ZPP set-reference-dir literature --allow-existing-target --json
+```
 
 # Manual changes and reconciliation
 
-Users are allowed to manually add, delete, or replace files in the reference directory. Treat these as drift, not as an instruction to delete Zotero data.
+Users may manually add, delete, or replace files in the reference directory. Treat this as drift, not as permission to delete Zotero data.
 
-Possible drift categories include:
+Drift categories include:
 
-- `localOnlyFiles`: user-added PDFs not represented by `papers.json`;
-- `missingManagedFiles`: a Zotero/project paper whose project PDF was manually removed;
-- `modifiedManagedFiles`: a formerly managed project path whose content was replaced;
-- `zoteroOnlyItemKeys`: collection changed after the last manifest generation;
-- `manifestOnlyItemKeys`: manifest still contains an item no longer in the collection.
+- `localOnlyFiles`;
+- `missingManagedFiles`;
+- `modifiedManagedFiles`;
+- `zoteroOnlyItemKeys`;
+- `manifestOnlyItemKeys`.
 
 Safety rules:
 
-- deleting a project PDF does **not** mean delete the Zotero paper;
+- deleting a project PDF never deletes the Zotero library item;
 - manually replacing a managed PDF is never silently overwritten;
-- `sync --prune` must skip user-modified formerly managed files;
-- adding a local PDF does not automatically import it until the user/agent chooses to reconcile it.
+- `sync --prune` skips user-modified files;
+- local-only PDFs are not automatically deleted.
 
-## User asks to unify
-
-Start with:
+If the user asks to unify:
 
 ```bash
 $ZPP reconcile --json
 ```
 
-This treats the Zotero project collection as canonical for managed papers: it regenerates manifest/BibTeX, restores missing canonical project PDFs, and removes stale helper-managed files only when explicitly requested with `--prune`.
+For each wanted local-only PDF, identify reliable metadata and use `import-pdf` so Zotero becomes canonical.
 
-If `unresolvedLocalOnlyFiles` remain, do not delete them automatically. For each wanted local-only PDF:
-
-1. identify/fetch reliable metadata;
-2. run `import-pdf` on that exact file;
-3. let the helper deduplicate against Zotero and absorb the local file into Zotero management.
-
-If the user explicitly says local-only PDFs should be discarded instead of imported, the destructive option is:
+Only if the user explicitly wants local-only PDFs discarded:
 
 ```bash
 $ZPP reconcile --remove-local-only --json
 ```
 
-Never use `--remove-local-only` without explicit user intent.
+# Reading and details
 
-When reconciliation reaches `clean`, the previous "continue despite drift" acknowledgement is cleared automatically.
+Resolve a selected paper:
 
-# Reading papers
+```bash
+$ZPP resolve ITEM_KEY --json
+```
 
-Prefer the project path from `resolve ITEM_KEY --json`. If direct PDF reading is available, read the actual PDF.
-
-For fast text-only retrieval:
+Prefer the project PDF path. For fast indexed text:
 
 ```bash
 $ZPP fulltext ITEM_KEY --max-chars 50000
 ```
 
-Use actual PDF layout when equations, tables, figures, or page fidelity matter.
+Use the actual PDF when equations, figures, tables, or page layout matter.
 
-MinerU remains optional; use it only if already available or explicitly added by the user.
+MinerU is optional and should not be invoked just because this skill activated.
 
-# Project synchronization and citations
+# Citations and synchronization
 
 Normal refresh:
 
@@ -313,22 +315,16 @@ Normal refresh:
 $ZPP sync --json
 ```
 
-Explicit cleanup of stale helper-managed files:
+Project outputs:
 
-```bash
-$ZPP sync --prune --json
-```
+- `<referenceDir>/papers.json` — compact agent manifest;
+- `papers/references.bib` by default — Zotero-exported BibTeX.
 
-The project maintains:
-
-- `<referenceDir>/papers.json`: agent-friendly project-paper manifest;
-- `papers/references.bib` by default: Zotero-exported BibTeX.
-
-Before literature-grounded writing, inspect the supporting paper text rather than relying on title/abstract alone. Surface duplicate DOI/title warnings and suspicious creator-role warnings instead of silently guessing citation metadata.
+Before literature-grounded writing, inspect supporting paper text rather than relying only on titles/abstracts. Surface duplicate DOI/title warnings and suspicious creator-role warnings instead of silently guessing.
 
 # Error handling
 
-Prefer `--json` for agent calls. Errors remain machine-readable and do not emit long tracebacks unless `ZPP_DEBUG=1` is set.
+Prefer `--json` for agent calls. Errors stay machine-readable and do not emit tracebacks unless `ZPP_DEBUG=1`.
 
 If write authorization is needed:
 
@@ -336,4 +332,4 @@ If write authorization is needed:
 $ZPP authorize --json
 ```
 
-Tell the user to choose **Always Allow** in Zotero. The helper waits up to 300 seconds for the human authorization action.
+Tell the user to choose **Always Allow** in Zotero. The helper waits up to 300 seconds.

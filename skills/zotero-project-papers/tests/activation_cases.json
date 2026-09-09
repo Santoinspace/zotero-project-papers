@@ -1,0 +1,52 @@
+{
+  "privacy": {
+    "sanitized": true,
+    "note": "Synthetic regression cases preserve only the activation pattern. They contain no project names, dataset names, model names, paper titles, URLs, local paths, or experimental metrics from the source conversation."
+  },
+  "cases": [
+    {
+      "id": "technical-theory-only",
+      "text": "从理论角度看，这个模块没有引入新的外部信息，还能稳定提升吗？",
+      "shouldTrigger": false
+    },
+    {
+      "id": "training-design-only",
+      "text": "训练时是否需要模拟部分输入属性缺失？模型应该怎样实现？",
+      "shouldTrigger": false
+    },
+    {
+      "id": "research-question-without-retrieval",
+      "text": "这种拒绝预测机制会怎样影响模型？这个方向有人研究吗？",
+      "shouldTrigger": false
+    },
+    {
+      "id": "explicit-top-conference-retrieval",
+      "text": "我暂时不认可当前方案。请参考2026年的顶级会议论文，提出几条适合当前项目、动机强、改动小、逻辑自洽的创新方向供我选择。",
+      "shouldTrigger": true
+    },
+    {
+      "id": "explicit-zotero-search",
+      "text": "先从我的 Zotero 里查找和这个主题相关的论文，本地没有再上网搜。",
+      "shouldTrigger": true
+    },
+    {
+      "id": "explicit-project-reference",
+      "text": "根据当前项目 reference 目录里的论文，帮我比较这两个方法。",
+      "shouldTrigger": true
+    },
+    {
+      "id": "ordinary-design",
+      "text": "帮我把这个模型方案改得更简单一些。",
+      "shouldTrigger": false
+    }
+  ],
+  "conversationRegression": {
+    "turns": [
+      "从理论角度看，这个模块没有引入新的外部信息，还能稳定提升吗？",
+      "训练时是否需要模拟部分输入属性缺失？",
+      "这种拒绝预测机制会怎样影响模型？",
+      "请参考2026年的顶级会议论文，提出几条适合当前项目、动机强、改动小、逻辑自洽的方向供我选择。"
+    ],
+    "expectedFirstTriggerTurn": 4
+  }
+}
