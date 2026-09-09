@@ -6,7 +6,7 @@ Zotero Project Papers connects the research/coding project you are currently wor
 
 Zotero remains where **you** manage and read papers. Your project's reference directory is where **the agent** works with the papers relevant to that project.
 
-## The most important behavior in v0.3
+## The most important behavior in v0.4
 
 This Skill is intentionally **not always-on**.
 
@@ -34,7 +34,7 @@ In a mixed conversation, the Skill should wait until the user explicitly switche
 
 ## Why local-first should actually be fast
 
-v0.3 uses this search order:
+v0.4 uses this search order:
 
 ```text
 1. Current-project papers.json
@@ -95,6 +95,13 @@ So a top-conference search might inspect 20 candidates but archive only the 5 pa
 - Hard links when possible to avoid duplicate PDF storage.
 - New PDFs imported through Zotero 10 rather than copied into `Zotero/storage` manually.
 - `papers.json` and project BibTeX generation.
+- Case-insensitive Zotero HTTP headers and layered `doctor` diagnostics.
+- Sandbox-safe authorization preflight with optional `ZPP_AUTH_STORE`.
+- Metadata-only evidence items (`import-metadata` / `import-doi`) and later `attach-pdf`.
+- Match explanations (`matchType`, `matchedFields`, score) with DOI/arXiv/title-first ranking.
+- Compact sync JSON by default; full paper arrays are opt-in.
+- DOI-based Crossref enrichment and a conservative validated `fetch` helper.
+- Optional Zotero tags and project child-collection organization.
 - Compact machine-readable errors and Windows-safe UTF-8 output.
 - No third-party Python dependencies.
 
@@ -242,6 +249,53 @@ python scripts/zotero_papers.py search "query" --scope library --json
 # Optional one-time cache warmup
 python scripts/zotero_papers.py cache --refresh --json
 ```
+
+## Metadata-only papers and later PDF attachment
+
+A project evidence set no longer requires every paper to have a downloadable PDF. If a paper is important but only reliable metadata is available, the agent can add it to Zotero/current project first:
+
+```bash
+python scripts/zotero_papers.py import-metadata paper.json --json
+# or, when a DOI is known
+python scripts/zotero_papers.py import-doi 10.xxxx/xxxx --json
+```
+
+`papers.json` marks it with `pdfStatus: "missing"`. A PDF can be attached later:
+
+```bash
+python scripts/zotero_papers.py attach-pdf ITEM_KEY paper.pdf --json
+```
+
+## Better diagnostics in sandboxed agents
+
+`doctor --json` now distinguishes Zotero unreachable, Local API disabled, authorization needed, unsupported version, malformed/unexpected local responses, and an unwritable authorization store. It does not ask the agent to change GUI settings when the evidence is ambiguous.
+
+If a sandbox cannot write the normal user config directory, choose a **private, gitignored** path:
+
+```bash
+ZPP_AUTH_STORE=/path/to/private/auth.json python scripts/zotero_papers.py authorize --json
+```
+
+## Validated paper fetch and DOI enrichment
+
+The helper does not replace the host agent's web search. After the agent selects an actual evidence paper, it can use a known official/OA PDF URL:
+
+```bash
+python scripts/zotero_papers.py fetch https://.../paper.pdf --metadata paper.json --import --json
+```
+
+The fetch helper uses HTTPS, follows redirects, validates PDF structure at a lightweight stdlib level, computes SHA-256, and is conservative about unfamiliar hosts. It does **not** claim that access rights are automatically verified.
+
+For DOI-bearing records, Crossref can fill common bibliographic fields:
+
+```bash
+python scripts/zotero_papers.py enrich ITEM_KEY --json
+python scripts/zotero_papers.py enrich ITEM_KEY --apply --json
+```
+
+## Topic organization (optional)
+
+When you explicitly want research-question views, the agent can add Zotero tags or create project child collections from a small JSON topic map. This is optional; the default project collection remains flat and simple.
 
 ## Privacy of activation regression tests
 

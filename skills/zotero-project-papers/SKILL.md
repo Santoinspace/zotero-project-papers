@@ -3,7 +3,7 @@ name: zotero-project-papers
 description: Use only when the user explicitly asks to find, search, survey, retrieve, or reference academic papers/literature; explicitly asks for top-conference/top-journal papers; explicitly asks to use Zotero or the project's reference papers; or explicitly asks for an answer grounded in actual papers. Do not activate merely because a technical question could benefit from citations, because the user asks whether something "has been studied", or for ordinary design/coding discussion without an explicit literature-retrieval request. When activated, search the current project and local Zotero first, use web only as needed, and archive papers actually used as evidence into Zotero and the project reference set.
 compatibility: Requires Zotero 10+ running locally with local application communication enabled and Python 3.10+. Designed for coding agents that can run local Python scripts; web search is supplied by the host agent.
 metadata:
-  version: "0.3.0"
+  version: "0.4.0"
 ---
 
 # Zotero Project Papers
@@ -83,15 +83,29 @@ python <this-skill-directory>/scripts/zotero_papers.py
 
 When CC Switch manages the skill, never self-install or edit the managed installed copy.
 
-# Fast preflight
+# Diagnostics and fast preflight
 
-Only after the activation policy is satisfied, perform one consistency preflight:
+Only after the activation policy is satisfied, perform one consistency preflight. Do not run `doctor` on every literature request; use it on first setup or after a Zotero/API/auth failure.
+
+When diagnosing Zotero, trust the structured `doctor --json` result. It distinguishes `zotero_unreachable`, `local_api_disabled`, `authorization_required`, `auth_store_unwritable`, unsupported versions, and unexpected responses. **Never launch computer-use/GUI automation to change Zotero settings merely because a header is missing or a diagnosis is uncertain.** Only use GUI automation if the user explicitly asks for it.
+
+HTTP response headers are case-insensitive; do not infer failure from `ID` vs `Id` spelling.
+
+For sandboxed agents, write authorization persistence can be redirected before authorization:
+
+```bash
+ZPP_AUTH_STORE=/private/writable/path/auth.json $ZPP authorize --json
+```
+
+Use a private, gitignored location for this key. The helper preflights writability before opening Zotero's authorization dialog.
+
+Then perform the project consistency preflight:
 
 ```bash
 $ZPP check --json
 ```
 
-In v0.3 this is normally a **quick marker check**. If the project files and cached Zotero library version are unchanged since the last full check, it returns without contacting Zotero.
+In v0.4 this is normally a **quick marker check**. If the project files and cached Zotero library version are unchanged since the last full check, it returns without contacting Zotero.
 
 Interpret:
 
@@ -141,7 +155,9 @@ Possible sources:
 - `zotero-direct-metadata`: direct localhost metadata search;
 - `zotero-fulltext`: Zotero indexed full-text fallback.
 
-The response includes `latencyMs`, `zoteroContacted`, and `webNeeded` so agent behavior can be audited.
+The response includes `latencyMs`, `zoteroContacted`, and `webNeeded` so agent behavior can be audited. Each candidate also reports `matchType`, `matchedFields`, and a normalized `score`. Treat identifier/title matches as evidence of identity; do not treat weak abstract/full-text matches as proof that the exact requested paper already exists.
+
+Match priority is DOI exact → arXiv exact → normalized-title exact → title phrase → title tokens / author+year → tags/venue → abstract/full-text fallback.
 
 For a term known to occur mainly inside PDFs:
 
@@ -169,7 +185,25 @@ Use host-agent web search only when local results are absent or insufficient for
 
 For requests such as “参考 2026 年顶会论文”, local hits may be useful but web search can still be necessary to verify coverage/freshness. Do not skip web merely because one older local paper matched.
 
-Before downloading a selected web paper, perform a final local Zotero duplicate check by title/DOI/arXiv when practical.
+Before downloading a selected web paper, perform a final local Zotero duplicate check using DOI → arXiv ID → normalized title → title+first-author+year.
+
+If a DOI is known, prefer metadata retrieval over manually composing metadata:
+
+```bash
+$ZPP import-doi 10.xxxx/xxxx --json
+```
+
+This uses Crossref for metadata and creates/reuses a project item even when no PDF is available. For an existing DOI-bearing Zotero item, preview metadata improvements with:
+
+```bash
+$ZPP enrich ITEM_KEY --json
+```
+
+Apply only after the user/agent has verified the diff and item type is unchanged:
+
+```bash
+$ZPP enrich ITEM_KEY --apply --json
+```
 
 # Evidence-set persistence — automatic after explicit literature retrieval
 
@@ -185,17 +219,33 @@ Before finalizing an explicitly literature-grounded answer:
 $ZPP add ITEM_KEY --json
 ```
 
-- for a selected web paper that is actually used as evidence, download a legitimate/reliable PDF when available, build metadata JSON, and run:
+- for a selected web paper actually used as evidence, persist the bibliographic record even if a legal/reliable PDF is unavailable. If metadata JSON is already known:
+
+```bash
+$ZPP import-metadata /tmp/paper.json --json
+```
+
+If a reliable PDF is available, prefer a validated import:
+
+```bash
+$ZPP fetch https://official-or-oa-host/paper.pdf --metadata /tmp/paper.json --import --json
+```
+
+or import an already-downloaded validated PDF:
 
 ```bash
 $ZPP import-pdf /path/to/paper.pdf --metadata /tmp/paper.json --json
 ```
 
-This should happen automatically after the user explicitly asked for literature retrieval; do not make the user separately say “add these papers to Zotero”.
+For a metadata-only item, `papers.json` records `pdfStatus=missing`. When a PDF later becomes available:
 
-Do **not** import every search result. Persist only papers actually used as evidence or explicitly requested by the user.
+```bash
+$ZPP attach-pdf ITEM_KEY /path/to/paper.pdf --json
+```
 
-If a selected paper cannot be legally/reliably downloaded, do not block the answer; report that it could not be archived automatically.
+This should happen automatically after the user explicitly asked for literature retrieval; do not make the user separately say “add these papers to Zotero”. Do **not** import every search result. Persist only papers actually used as evidence or explicitly requested by the user.
+
+The built-in `fetch` command accepts HTTPS, follows redirects, uses a conservative academic-host allowlist by default, verifies the PDF header/EOF/size/hash, and reports that access rights are **not automatically verified**. Prefer official or open-access URLs. Never bypass paywalls or use untrusted mirrors.
 
 # First use and project binding
 
@@ -289,6 +339,31 @@ Only if the user explicitly wants local-only PDFs discarded:
 $ZPP reconcile --remove-local-only --json
 ```
 
+# Topic organization (explicit only)
+
+Do not create a taxonomy automatically on every search. When the user asks to organize literature by research question, use Zotero tags or a topic map.
+
+Add/remove a tag:
+
+```bash
+$ZPP tag ITEM_KEY "prompt-uncertainty" --json
+$ZPP tag ITEM_KEY "prompt-uncertainty" --remove --json
+```
+
+For project child collections, create a small JSON topic map:
+
+```json
+{"topics": {"Multi-scale Fusion": ["ITEMKEY1"], "Missing Text": ["ITEMKEY2"]}}
+```
+
+then:
+
+```bash
+$ZPP organize /tmp/topic-map.json --json
+```
+
+The item remains in the main project collection; child collections are additional views.
+
 # Reading and details
 
 Resolve a selected paper:
@@ -313,6 +388,12 @@ Normal refresh:
 
 ```bash
 $ZPP sync --json
+```
+
+JSON is compact by default (`paperCount`, `added`, `updated`, `removed`, `withPdf`, consistency summary). Only request the full paper array when truly needed:
+
+```bash
+$ZPP sync --include-papers --json
 ```
 
 Project outputs:

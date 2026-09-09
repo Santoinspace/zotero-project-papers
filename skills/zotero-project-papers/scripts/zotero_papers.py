@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.3.0
+"""zotero-project-papers v0.4.0
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import mimetypes
 import os
@@ -33,7 +34,7 @@ from typing import Any, Iterable
 APP_NAME = "Zotero Project Papers"
 BASE_URL = os.environ.get("ZOTERO_LOCAL_API", "http://127.0.0.1:23119/api/").rstrip("/") + "/"
 CONFIG_NAME = ".zotero-project.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_COLLECTION_ROOT = "Projects"
 DEFAULT_REFERENCE_DIR = "papers/reference"
 DEFAULT_BIB_FILE = "papers/references.bib"
@@ -42,6 +43,14 @@ REFERENCE_CANDIDATES = ("reference", "references", "refs", "literature", "litera
 AUTH_TIMEOUT = int(os.environ.get("ZPP_AUTH_TIMEOUT", "300"))
 CACHE_TTL_SECONDS = int(os.environ.get("ZPP_CACHE_TTL", "60"))
 DEFAULT_SEARCH_LIMIT = 10
+DEFAULT_MATCH_THRESHOLD = float(os.environ.get("ZPP_MATCH_THRESHOLD", "0.45"))
+CROSSREF_BASE_URL = os.environ.get("ZPP_CROSSREF_API", "https://api.crossref.org").rstrip("/")
+TRUSTED_PAPER_HOSTS = {
+    "arxiv.org", "export.arxiv.org", "openreview.net", "proceedings.neurips.cc",
+    "openaccess.thecvf.com", "papers.miccai.org", "aclanthology.org", "jmlr.org",
+    "proceedings.mlr.press", "dl.acm.org", "ieeexplore.ieee.org", "link.springer.com",
+    "nature.com", "www.nature.com", "science.org", "www.science.org",
+}
 
 # Creating items does not require /items/new. Zotero Local API implementations may
 # omit that Web-API convenience endpoint, so creation uses itemTypeFields when
@@ -148,7 +157,39 @@ def cache_db_path(server_id: str) -> Path:
 
 
 def auth_path() -> Path:
+    override = os.environ.get("ZPP_AUTH_STORE")
+    if override:
+        return Path(override).expanduser().resolve()
     return user_config_dir() / "auth.json"
+
+
+def auth_store_preflight(*, create: bool = False) -> dict[str, Any]:
+    """Check whether the authorization store can be persisted before prompting Zotero."""
+    path = auth_path()
+    parent = path.parent
+    try:
+        if create:
+            parent.mkdir(parents=True, exist_ok=True)
+        if not parent.exists():
+            return {"path": str(path), "writable": False, "reason": "parent-directory-missing"}
+        probe = parent / f".{path.name}.write-test-{uuid.uuid4().hex}"
+        probe.write_bytes(b"")
+        probe.unlink()
+        return {"path": str(path), "writable": True, "reason": None}
+    except Exception as exc:
+        return {"path": str(path), "writable": False, "reason": str(exc)}
+
+
+def ensure_auth_store_writable() -> dict[str, Any]:
+    status = auth_store_preflight(create=True)
+    if not status["writable"]:
+        raise ZPPError(
+            f"Authorization can be granted by Zotero, but the key cannot be persisted at {status['path']}.",
+            code="auth_store_unwritable",
+            hint="Set ZPP_AUTH_STORE to a writable private path, then retry authorization. The skill will not open the Zotero authorization dialog until persistence is writable.",
+            details=status,
+        )
+    return status
 
 
 def load_auth_store() -> dict[str, Any]:
@@ -178,8 +219,10 @@ def save_auth_store(data: dict[str, Any]) -> None:
 
 def normalize_title(value: str) -> str:
     value = value.casefold().strip()
-    value = re.sub(r"\s+", " ", value)
-    value = re.sub(r"[^\w\s]", "", value, flags=re.UNICODE)
+    # Treat punctuation/hyphens as token boundaries rather than deleting them, so
+    # "cross-scale" and "cross scale" normalize identically.
+    value = re.sub(r"[^\w\s]", " ", value, flags=re.UNICODE)
+    value = re.sub(r"\s+", " ", value).strip()
     return value
 
 
@@ -235,7 +278,7 @@ def default_sync_config() -> dict[str, Any]:
         "driftPolicy": "prompt",
         "acknowledgedFingerprint": None,
         "acknowledgedAt": None,
-        # v0.3 quick preflight markers. These avoid a Zotero round-trip when neither
+        # v0.4 quick preflight markers. These avoid a Zotero round-trip when neither
         # the project reference view nor the cached Zotero library version changed.
         "quickFingerprint": None,
         "lastFullClean": None,
@@ -312,6 +355,22 @@ def detect_reference_dirs(root: Path) -> list[dict[str, Any]]:
     return found
 
 
+def possible_legacy_reference_dirs(root: Path, active_reference_dir: str) -> list[dict[str, Any]]:
+    """Report plausible old reference directories without treating them as active state."""
+    active = Path(active_reference_dir).as_posix().rstrip("/")
+    rows = []
+    for row in detect_reference_dirs(root):
+        rel = Path(str(row.get("path") or "")).as_posix().rstrip("/")
+        if not rel or rel == active:
+            continue
+        # Prefer singular/plural and common historical aliases, but include other detected
+        # literature folders so migrations remain visible rather than looking like data loss.
+        candidate = dict(row)
+        candidate["reason"] = "possible-legacy-reference-directory"
+        rows.append(candidate)
+    return rows
+
+
 def unique_flatten_destination(target: Path, source: Path) -> Path:
     name = safe_filename(source.name)
     dest = target / name
@@ -358,11 +417,22 @@ def flatten_reference_pdfs(source_dir: Path, target_dir: Path, fallback: str = "
     return results
 
 
+def normalize_http_headers(headers: Iterable[tuple[str, str]] | dict[str, str]) -> dict[str, str]:
+    items = headers.items() if isinstance(headers, dict) else headers
+    return {str(k).casefold(): str(v) for k, v in items}
+
+
 @dataclass
 class HTTPResult:
     status: int
     headers: dict[str, str]
     body: bytes
+
+    def __post_init__(self) -> None:
+        self.headers = normalize_http_headers(self.headers)
+
+    def header(self, name: str, default: str | None = None) -> str | None:
+        return self.headers.get(name.casefold(), default)
 
     def json(self) -> Any:
         if not self.body:
@@ -397,7 +467,7 @@ class ZoteroClient:
         req = urllib.request.Request(url, data=body, method=method, headers=headers or {})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return HTTPResult(resp.status, dict(resp.headers.items()), resp.read())
+                return HTTPResult(resp.status, normalize_http_headers(resp.headers.items()), resp.read())
         except urllib.error.HTTPError as exc:
             payload = exc.read()
             detail = payload.decode("utf-8", errors="replace").strip()
@@ -413,6 +483,12 @@ class ZoteroClient:
                 f"Zotero HTTP {exc.code} for {method} {url}: {detail or exc.reason}.",
                 code=code,
                 hint=hint,
+                details={
+                    "status": exc.code,
+                    "url": url,
+                    "headers": normalize_http_headers(exc.headers.items()) if exc.headers else {},
+                    "body": detail[:500],
+                },
             ) from exc
         except urllib.error.URLError as exc:
             reason = exc.reason
@@ -436,13 +512,29 @@ class ZoteroClient:
 
     def bootstrap(self) -> None:
         result = self._raw_request("GET", "")
-        self.server_id = result.headers.get("Zotero-Server-ID")
-        self.api_version = result.headers.get("Zotero-API-Version")
+        self.server_id = result.header("Zotero-Server-ID")
+        self.api_version = result.header("Zotero-API-Version")
+        zotero_version = result.header("X-Zotero-Version")
         if not self.server_id:
-            raise ZPPError("Running Zotero does not expose Zotero-Server-ID. Zotero 10+ is required for this skill.")
-        store = load_auth_store()
-        entry = store.get("servers", {}).get(self.server_id, {})
-        self.api_key = entry.get("key")
+            raise ZPPError(
+                "Connected to the local HTTP service, but the response did not include Zotero-Server-ID.",
+                code="zotero_server_id_missing",
+                hint="Do not change Zotero settings automatically. Run `doctor --json` to distinguish a version/port/proxy response from the Zotero 10 Local API.",
+                details={
+                    "status": result.status,
+                    "xZoteroVersion": zotero_version,
+                    "apiVersion": self.api_version,
+                    "headers": sorted(result.headers.keys()),
+                },
+            )
+        try:
+            store = load_auth_store()
+            entry = store.get("servers", {}).get(self.server_id, {})
+            self.api_key = entry.get("key")
+        except ZPPError:
+            # Read-only local Zotero access must not fail just because a sandbox blocks
+            # the optional persisted write-key store. doctor/authorize report this separately.
+            self.api_key = None
 
     def read(self, path: str, params: dict[str, Any] | None = None, *, raw: bool = False) -> Any:
         if self.server_id is None:
@@ -457,6 +549,9 @@ class ZoteroClient:
     def authorize(self, require_remembered: bool = True) -> dict[str, Any]:
         if self.server_id is None:
             self.bootstrap()
+        persistence = auth_store_preflight(create=False)
+        if require_remembered:
+            persistence = ensure_auth_store_writable()
         payload = json.dumps({"appName": APP_NAME}).encode("utf-8")
         headers = {
             "Content-Type": "application/json",
@@ -475,19 +570,39 @@ class ZoteroClient:
         key = data.get("key") if isinstance(data, dict) else None
         remembered = bool(data.get("remember")) if isinstance(data, dict) else False
         if not key:
-            raise ZPPError("Zotero did not return a local write key.")
+            raise ZPPError("Zotero did not return a local write key.", code="authorization_no_key")
         self.api_key = key
+        token_persisted = False
+        persistence_error: str | None = None
         if remembered:
-            store = load_auth_store()
-            store.setdefault("servers", {})[self.server_id or ""] = {
-                "key": key,
-                "remember": True,
-                "savedAt": utc_now(),
-            }
-            save_auth_store(store)
+            try:
+                store = load_auth_store()
+                store.setdefault("servers", {})[self.server_id or ""] = {
+                    "key": key,
+                    "remember": True,
+                    "savedAt": utc_now(),
+                }
+                save_auth_store(store)
+                token_persisted = True
+            except Exception as exc:
+                persistence_error = str(exc)
         if require_remembered and not remembered:
-            raise ZPPError("This operation needs reusable authorization. Run `authorize` again and choose 'Always Allow' in Zotero.")
-        return {"authorized": True, "remembered": remembered, "serverID": self.server_id}
+            raise ZPPError(
+                "Zotero granted only one-shot authorization, but this operation needs a reusable key.",
+                code="authorization_not_remembered",
+                hint="Run `authorize` again and choose 'Always Allow' in Zotero.",
+                details={"authorizationGranted": True, "remembered": False, "tokenPersisted": False},
+            )
+        return {
+            "ok": not (remembered and not token_persisted),
+            "authorizationGranted": True,
+            "authorized": True,
+            "remembered": remembered,
+            "tokenPersisted": token_persisted if remembered else False,
+            "authStore": str(auth_path()),
+            "persistenceError": persistence_error,
+            "serverID": self.server_id,
+        }
 
     def ensure_write_auth(self, require_remembered: bool = True) -> None:
         if self.server_id is None:
@@ -527,7 +642,7 @@ class ZoteroClient:
             return result
         if not result.body:
             return None
-        ctype = result.headers.get("Content-Type", "")
+        ctype = result.header("Content-Type", "") or ""
         return result.json() if "json" in ctype or result.body[:1] in (b"{", b"[") else result.text()
 
     def upload_bytes(self, url: str, file_path: Path, content_type: str) -> None:
@@ -612,6 +727,8 @@ def _cache_connect(server_id: str) -> sqlite3.Connection:
             tags_text TEXT,
             collections_json TEXT,
             url TEXT,
+            arxiv_id TEXT,
+            extra TEXT,
             updated_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_items_doi ON items(doi);
@@ -619,6 +736,12 @@ def _cache_connect(server_id: str) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_items_title ON items(title);
         """
     )
+    existing_cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(items)").fetchall()}
+    if "arxiv_id" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN arxiv_id TEXT")
+    if "extra" not in existing_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN extra TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_arxiv ON items(arxiv_id)")
     return conn
 
 
@@ -668,34 +791,28 @@ def _cache_upsert_item(conn: sqlite3.Connection, obj: dict[str, Any]) -> None:
     creator_names = [creator_name(c) for c in creators]
     tags = [str(t.get("tag")) for t in (d.get("tags") or []) if isinstance(t, dict) and t.get("tag")]
     collections = [str(x) for x in (d.get("collections") or []) if x]
+    arxiv_id = record_arxiv_id(d)
     conn.execute(
         """
         INSERT INTO items(
             key,version,item_type,title,creators_json,creators_text,date,doi,
-            publication_title,abstract_note,tags_text,collections_json,url,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            publication_title,abstract_note,tags_text,collections_json,url,arxiv_id,extra,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(key) DO UPDATE SET
             version=excluded.version,item_type=excluded.item_type,title=excluded.title,
             creators_json=excluded.creators_json,creators_text=excluded.creators_text,
             date=excluded.date,doi=excluded.doi,publication_title=excluded.publication_title,
             abstract_note=excluded.abstract_note,tags_text=excluded.tags_text,
-            collections_json=excluded.collections_json,url=excluded.url,updated_at=excluded.updated_at
+            collections_json=excluded.collections_json,url=excluded.url,arxiv_id=excluded.arxiv_id,
+            extra=excluded.extra,updated_at=excluded.updated_at
         """,
         (
-            key,
-            int(d.get("version") or obj.get("version") or 0),
-            item_type,
-            str(d.get("title") or ""),
-            json.dumps(creators, ensure_ascii=False),
-            " | ".join(creator_names),
-            str(d.get("date") or ""),
-            normalize_doi(str(d.get("DOI") or "")),
+            key, int(d.get("version") or obj.get("version") or 0), item_type,
+            str(d.get("title") or ""), json.dumps(creators, ensure_ascii=False), " | ".join(creator_names),
+            str(d.get("date") or ""), normalize_doi(str(d.get("DOI") or "")),
             str(d.get("publicationTitle") or d.get("proceedingsTitle") or d.get("conferenceName") or ""),
-            str(d.get("abstractNote") or ""),
-            " | ".join(tags),
-            json.dumps(collections, ensure_ascii=False),
-            str(d.get("url") or ""),
-            utc_now(),
+            str(d.get("abstractNote") or ""), " | ".join(tags), json.dumps(collections, ensure_ascii=False),
+            str(d.get("url") or ""), arxiv_id, str(d.get("extra") or ""), utc_now(),
         ),
     )
 
@@ -705,7 +822,7 @@ def _raw_json_page(client: "ZoteroClient", path: str, params: dict[str, Any]) ->
     assert isinstance(result, HTTPResult)
     payload = result.json() if result.body else []
     rows = [x for x in payload if isinstance(x, dict)] if isinstance(payload, list) else []
-    lmv = result.headers.get("Last-Modified-Version")
+    lmv = result.header("Last-Modified-Version")
     return rows, int(lmv) if lmv and str(lmv).isdigit() else None
 
 
@@ -758,7 +875,7 @@ def refresh_metadata_cache(client: "ZoteroClient", *, force: bool = False, max_a
                 for key in payload.get("items", []) or []:
                     conn.execute("DELETE FROM items WHERE key=?", (str(key),))
                     deleted_count += 1
-            lmv = result.headers.get("Last-Modified-Version")
+            lmv = result.header("Last-Modified-Version")
             if lmv and str(lmv).isdigit():
                 latest_version = max(latest_version or 0, int(lmv))
 
@@ -783,42 +900,122 @@ def refresh_metadata_cache(client: "ZoteroClient", *, force: bool = False, max_a
 
 
 def _query_tokens(query: str) -> list[str]:
-    return [x for x in re.findall(r"[\w.-]+", query.casefold(), flags=re.UNICODE) if len(x) > 1][:12]
+    return [x for x in re.findall(r"[\w.-]+", query.casefold(), flags=re.UNICODE) if len(x) > 1][:16]
+
+
+def extract_year(value: Any) -> str:
+    m = re.search(r"(?:19|20)\d{2}", str(value or ""))
+    return m.group(0) if m else ""
+
+
+def extract_arxiv_id(value: Any) -> str:
+    text = str(value or "")
+    # Modern IDs (YYMM.NNNNN) and legacy archive/category IDs.
+    m = re.search(r"(?i)(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)?((?:\d{4}\.\d{4,5})(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?:\.pdf)?", text)
+    if not m:
+        return ""
+    return re.sub(r"v\d+$", "", m.group(1), flags=re.I).casefold()
+
+
+def record_arxiv_id(record: dict[str, Any]) -> str:
+    for field in ("arxiv", "arxivID", "archiveID", "extra", "url", "DOI"):
+        value = record.get(field)
+        found = extract_arxiv_id(value)
+        if found:
+            return found
+    return ""
+
+
+def _first_creator_last_name(record: dict[str, Any]) -> str:
+    creators = record.get("creators") or []
+    if creators and isinstance(creators[0], dict):
+        c = creators[0]
+        return str(c.get("lastName") or c.get("name") or "").casefold().strip()
+    if creators:
+        text = str(creators[0]).strip().casefold()
+        return text.split()[-1] if text else ""
+    return ""
+
+
+def classify_match(record: dict[str, Any], query: str, *, allow_abstract: bool = True) -> dict[str, Any]:
+    """Rank matches conservatively and explain why a candidate matched.
+
+    Scores are normalized to 0..1. Exact identifiers/titles outrank phrase/token matches;
+    abstract-only matches are deliberately weak so they do not masquerade as "already have
+    this paper" when the user supplied a specific title.
+    """
+    q = query.strip()
+    qnorm = normalize_title(q)
+    qdoi = normalize_doi(q) if re.search(r"10\.\d{4,9}/", q, re.I) else ""
+    qarxiv = extract_arxiv_id(q)
+    title = str(record.get("title") or "")
+    title_norm = normalize_title(title)
+    doi = normalize_doi(str(record.get("DOI") or record.get("doi") or ""))
+    arxiv = record_arxiv_id(record)
+    publication = str(record.get("publicationTitle") or record.get("publication_title") or "")
+    creators_text = " ".join(
+        creator_name(x) if isinstance(x, dict) else str(x)
+        for x in (record.get("creators") or [])
+    )
+    date = str(record.get("date") or "")
+    tags = str(record.get("tagsText") or record.get("tags_text") or "")
+    abstract = str(record.get("abstractNote") or record.get("abstract_note") or "")
+
+    if qdoi and doi and qdoi == doi:
+        return {"score": 1.0, "matchType": "doi-exact", "matchedFields": ["DOI"]}
+    if qarxiv and arxiv and qarxiv == arxiv:
+        return {"score": 0.995, "matchType": "arxiv-exact", "matchedFields": ["arXiv"]}
+    if qnorm and title_norm and qnorm == title_norm:
+        return {"score": 0.98, "matchType": "normalized-title-exact", "matchedFields": ["title"]}
+    if qnorm and len(qnorm) >= 12 and qnorm in title_norm:
+        return {"score": 0.93, "matchType": "title-phrase", "matchedFields": ["title"]}
+
+    tokens = _query_tokens(q)
+    if not tokens:
+        return {"score": 0.0, "matchType": "none", "matchedFields": []}
+    title_tokens = set(_query_tokens(title_norm))
+    query_tokens = set(tokens)
+    title_hits = query_tokens & title_tokens
+    coverage = len(title_hits) / max(1, len(query_tokens))
+    fields: list[str] = []
+    score = 0.0
+    match_type = "weak"
+    if title_hits:
+        fields.append("title")
+        score = 0.48 + 0.42 * coverage
+        match_type = "title-token"
+    pub_hits = [t for t in tokens if t in publication.casefold()]
+    if pub_hits:
+        fields.append("publicationTitle")
+        score = max(score, 0.48 + 0.08 * min(3, len(pub_hits)))
+        if match_type == "weak": match_type = "venue-token"
+    creator_hits = [t for t in tokens if t in creators_text.casefold()]
+    year_q = extract_year(q)
+    if creator_hits and year_q and year_q == extract_year(date):
+        fields.extend(x for x in ("creators", "date") if x not in fields)
+        score = max(score, 0.78)
+        match_type = "author-year"
+    tag_hits = [t for t in tokens if t in tags.casefold()]
+    if tag_hits:
+        fields.append("tags")
+        score = max(score, 0.50 + 0.04 * min(3, len(tag_hits)))
+        if match_type == "weak": match_type = "tag-token"
+    if allow_abstract:
+        abstract_hits = [t for t in tokens if t in abstract.casefold()]
+        if abstract_hits:
+            fields.append("abstractNote")
+            # Abstract-only hits are useful for topical discovery, not duplicate certainty.
+            abstract_coverage = len(set(abstract_hits)) / max(1, len(query_tokens))
+            if score == 0:
+                score = 0.28 + 0.22 * abstract_coverage
+                match_type = "abstract-token"
+            else:
+                score = min(0.94, score + 0.04 * abstract_coverage)
+    return {"score": round(min(1.0, score), 4), "matchType": match_type if score else "none", "matchedFields": sorted(set(fields))}
 
 
 def _score_text_record(record: dict[str, Any], query: str) -> float:
-    phrase = query.casefold().strip()
-    tokens = _query_tokens(query)
-    title = str(record.get("title") or "").casefold()
-    creators = " ".join(str(x) for x in (record.get("creators") or [])).casefold()
-    date = str(record.get("date") or "").casefold()
-    doi = str(record.get("DOI") or record.get("doi") or "").casefold()
-    publication = str(record.get("publicationTitle") or record.get("publication_title") or "").casefold()
-    tags = str(record.get("tagsText") or record.get("tags_text") or "").casefold()
-    abstract = str(record.get("abstractNote") or record.get("abstract_note") or "").casefold()
-    if not tokens and not phrase:
-        return 0.0
-    score = 0.0
-    if phrase and phrase in title:
-        score += 120.0
-    elif phrase and phrase in publication:
-        score += 50.0
-    for t in tokens:
-        if t in title:
-            score += 20.0
-        if t in publication:
-            score += 10.0
-        if t in tags:
-            score += 9.0
-        if t in creators:
-            score += 5.0
-        if t in date:
-            score += 5.0
-        if t in doi:
-            score += 8.0
-        if t in abstract:
-            score += 2.0
-    return score
+    return float(classify_match(record, query).get("score") or 0.0)
 
 
 def search_manifest(root: Path, config: dict[str, Any], query: str, limit: int) -> list[dict[str, Any]]:
@@ -827,19 +1024,15 @@ def search_manifest(root: Path, config: dict[str, Any], query: str, limit: int) 
     for p in manifest.get("papers", []) or []:
         if not isinstance(p, dict):
             continue
-        score = _score_text_record(p, query)
-        if score <= 0:
+        match = classify_match(p, query, allow_abstract=True)
+        score = float(match["score"])
+        if score < DEFAULT_MATCH_THRESHOLD:
             continue
         summary = {
-            "key": p.get("itemKey"),
-            "itemType": p.get("itemType"),
-            "title": p.get("title", ""),
-            "creators": p.get("creators", []) or [],
-            "date": p.get("date", ""),
-            "DOI": p.get("DOI", ""),
-            "publicationTitle": p.get("publicationTitle", ""),
-            "projectPath": p.get("projectPath"),
-            "score": round(score, 2),
+            "key": p.get("itemKey"), "itemType": p.get("itemType"), "title": p.get("title", ""),
+            "creators": p.get("creators", []) or [], "date": p.get("date", ""), "DOI": p.get("DOI", ""),
+            "publicationTitle": p.get("publicationTitle", ""), "projectPath": p.get("projectPath"),
+            **match,
         }
         rows.append((score, summary))
     rows.sort(key=lambda x: (-x[0], str(x[1].get("date") or ""), str(x[1].get("title") or "").casefold()))
@@ -853,21 +1046,27 @@ def search_metadata_cache(server_id: str, query: str, limit: int, *, collection_
     conn = _cache_connect(server_id)
     try:
         tokens = _query_tokens(query)
-        if not tokens:
-            return []
-        cols = ["title", "creators_text", "date", "doi", "publication_title", "abstract_note", "tags_text"]
-        ors: list[str] = []
+        qdoi = normalize_doi(query) if re.search(r"10\.\d{4,9}/", query, re.I) else ""
+        qarxiv = extract_arxiv_id(query)
         params: list[Any] = []
+        clauses: list[str] = []
+        if qdoi:
+            clauses.append("doi = ?")
+            params.append(qdoi)
+        if qarxiv:
+            clauses.append("arxiv_id = ?")
+            params.append(qarxiv)
         for token in tokens:
-            for col in cols:
-                ors.append(f"lower({col}) LIKE ?")
+            for col in ("title", "creators_text", "date", "doi", "publication_title", "abstract_note", "tags_text", "arxiv_id", "extra"):
+                clauses.append(f"lower({col}) LIKE ?")
                 params.append(f"%{token}%")
-        where = "(" + " OR ".join(ors) + ")"
+        if not clauses:
+            return []
+        where = "(" + " OR ".join(clauses) + ")"
         if collection_key:
             where += " AND collections_json LIKE ?"
             params.append(f'%"{collection_key}"%')
-        sql = f"SELECT * FROM items WHERE {where} LIMIT 300"
-        candidates = conn.execute(sql, params).fetchall()
+        candidates = conn.execute(f"SELECT * FROM items WHERE {where} LIMIT 300", params).fetchall()
         scored: list[tuple[float, dict[str, Any]]] = []
         for row in candidates:
             creators_detailed = json.loads(row["creators_json"] or "[]")
@@ -877,22 +1076,22 @@ def search_metadata_cache(server_id: str, query: str, limit: int, *, collection_
                 "creators": creators, "date": row["date"] or "", "DOI": row["doi"] or "",
                 "publicationTitle": row["publication_title"] or "", "abstractNote": row["abstract_note"] or "",
                 "tagsText": row["tags_text"] or "", "collections": json.loads(row["collections_json"] or "[]"),
-                "url": row["url"] or "",
+                "url": row["url"] or "", "arxivID": row["arxiv_id"] or "", "extra": row["extra"] or "",
             }
-            score = _score_text_record(record, query)
-            if score <= 0:
+            match = classify_match(record, query, allow_abstract=True)
+            score = float(match["score"])
+            if score < DEFAULT_MATCH_THRESHOLD:
                 continue
             out = {
                 "key": record["key"], "itemType": record["itemType"], "title": record["title"],
                 "creators": record["creators"], "date": record["date"], "DOI": record["DOI"],
-                "publicationTitle": record["publicationTitle"], "score": round(score, 2),
+                "publicationTitle": record["publicationTitle"], "arxivID": record["arxivID"], **match,
             }
             if verbose:
                 out.update({
                     "abstractNote": record["abstractNote"],
                     "tags": [x.strip() for x in str(record["tagsText"]).split("|") if x.strip()],
-                    "collections": record["collections"],
-                    "url": record["url"],
+                    "collections": record["collections"], "url": record["url"], "extra": record["extra"],
                 })
             scored.append((score, out))
         scored.sort(key=lambda x: (-x[0], str(x[1].get("date") or ""), str(x[1].get("title") or "").casefold()))
@@ -969,7 +1168,8 @@ def item_summary(obj: dict[str, Any], *, brief: bool = False) -> dict[str, Any]:
         "creators": [creator_name(c) for c in creators_raw],
         "date": d.get("date", ""),
         "DOI": d.get("DOI", ""),
-        "publicationTitle": d.get("publicationTitle", ""),
+        "arxivID": record_arxiv_id(d),
+        "publicationTitle": d.get("publicationTitle", "") or d.get("proceedingsTitle", "") or d.get("conferenceName", ""),
     }
     if brief:
         return result
@@ -1101,24 +1301,76 @@ def library_search(client: ZoteroClient, query: str, fulltext: bool = False, lim
     return out
 
 
+def rank_zotero_rows(rows: list[dict[str, Any]], query: str, *, fulltext: bool, limit: int, verbose: bool = False) -> list[dict[str, Any]]:
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for obj in rows:
+        summary_full = item_summary(obj, brief=False)
+        match = classify_match(summary_full, query, allow_abstract=True)
+        score = float(match["score"])
+        if fulltext and score < DEFAULT_MATCH_THRESHOLD:
+            # Zotero itself returned the item from indexed full text. Keep it as a weak,
+            # explicitly-labelled candidate rather than pretending metadata matched.
+            match = {"score": 0.40, "matchType": "zotero-fulltext", "matchedFields": ["fulltext"]}
+            score = 0.40
+        if not fulltext and score < DEFAULT_MATCH_THRESHOLD:
+            continue
+        out = item_summary(obj, brief=not verbose)
+        out.update(match)
+        ranked.append((score, out))
+    ranked.sort(key=lambda x: (-x[0], str(x[1].get("date") or ""), str(x[1].get("title") or "").casefold()))
+    return [x[1] for x in ranked[:limit]]
+
+
 def find_duplicates(client: ZoteroClient, metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    """Conservative duplicate cascade: DOI -> arXiv -> normalized title -> title+author+year."""
     matches: dict[str, dict[str, Any]] = {}
     doi = normalize_doi(str(metadata.get("DOI") or ""))
+    arxiv = record_arxiv_id(metadata)
+    title = str(metadata.get("title") or "").strip()
+    target_title = normalize_title(title)
+    first_author = _first_creator_last_name(metadata)
+    year = extract_year(metadata.get("date"))
+
+    def remember(obj: dict[str, Any]) -> None:
+        key = str(item_summary(obj, brief=True).get("key") or "")
+        if key:
+            matches[key] = obj
+
     if doi:
         for obj in library_search(client, doi, fulltext=True, limit=100):
-            d = item_data(obj)
-            if normalize_doi(str(d.get("DOI") or "")) == doi:
-                key = str(item_summary(obj, brief=True).get("key") or "")
-                if key:
-                    matches[key] = obj
-    title = str(metadata.get("title") or "").strip()
+            if normalize_doi(str(item_data(obj).get("DOI") or "")) == doi:
+                remember(obj)
+        if matches:
+            return list(matches.values())
+
+    if arxiv:
+        for obj in library_search(client, arxiv, fulltext=True, limit=100):
+            if record_arxiv_id(item_data(obj)) == arxiv:
+                remember(obj)
+        if matches:
+            return list(matches.values())
+
     if title:
-        target = normalize_title(title)
         for obj in library_search(client, title, fulltext=False, limit=100):
-            if normalize_title(str(item_data(obj).get("title") or "")) == target:
-                key = str(item_summary(obj, brief=True).get("key") or "")
-                if key:
-                    matches[key] = obj
+            d = item_data(obj)
+            if normalize_title(str(d.get("title") or "")) == target_title:
+                remember(obj)
+        if matches:
+            return list(matches.values())
+
+    # Last-resort identity heuristic is intentionally strict: title must be highly similar
+    # and first author + year must agree.
+    if title and first_author and year:
+        for obj in library_search(client, title, fulltext=False, limit=100):
+            d = item_data(obj)
+            candidate = {
+                "title": d.get("title", ""), "creators": d.get("creators", []), "date": d.get("date", "")
+            }
+            title_match = classify_match(candidate, title, allow_abstract=False)
+            if float(title_match["score"]) < 0.90:
+                continue
+            if _first_creator_last_name(candidate) == first_author and extract_year(candidate.get("date")) == year:
+                remember(obj)
     return list(matches.values())
 
 
@@ -1358,6 +1610,7 @@ def project_record(client: ZoteroClient, obj: dict[str, Any], root: Path, config
     record["attachments"] = attachments
     record["projectPath"] = None
     record["materialization"] = None
+    record["pdfStatus"] = "missing"
     if chosen:
         source = Path(chosen["path"])
         ref_dir = root / config["referenceDir"]
@@ -1368,6 +1621,7 @@ def project_record(client: ZoteroClient, obj: dict[str, Any], root: Path, config
         record["materialization"] = mode
         record["attachmentKey"] = chosen.get("key")
         record["zoteroPath"] = str(source)
+        record["pdfStatus"] = "available"
     return record
 
 
@@ -1428,18 +1682,41 @@ def sync_project(client: ZoteroClient, root: Path, config: dict[str, Any], prune
                 pruned.append(relpath_for_manifest(candidate, root))
     snapshot = consistency_snapshot(client, root, config)
     consistency = persist_consistency_state(root, config, snapshot)
+    old_rows = {str(p.get("itemKey")): p for p in old.get("papers", []) if isinstance(p, dict) and p.get("itemKey")}
+    new_rows = {str(p.get("itemKey")): p for p in papers if p.get("itemKey")}
+    old_keys = set(old_rows)
+    new_keys = set(new_rows)
+    sig_fields = ("title", "date", "DOI", "publicationTitle", "attachmentKey", "projectPath", "pdfStatus")
+    updated_keys = sorted(
+        key for key in (old_keys & new_keys)
+        if any(old_rows[key].get(f) != new_rows[key].get(f) for f in sig_fields)
+    )
     return {
         "projectRoot": str(root),
         "collection": config["collectionPath"],
         "paperCount": len(papers),
         "withPdf": sum(1 for p in papers if p.get("projectPath")),
+        "withoutPdf": sum(1 for p in papers if not p.get("projectPath")),
         "manifest": config["manifestFile"],
         "bib": config["bibFile"],
+        "added": len(new_keys - old_keys),
+        "updated": len(updated_keys),
+        "removed": len(old_keys - new_keys),
+        "addedItemKeys": sorted(new_keys - old_keys),
+        "updatedItemKeys": updated_keys,
+        "removedItemKeys": sorted(old_keys - new_keys),
         "pruned": pruned,
         "pruneSkippedModified": prune_skipped_modified,
         "consistency": consistency,
         "papers": papers,
     }
+
+
+def compact_sync_result(result: dict[str, Any], *, include_papers: bool = False) -> dict[str, Any]:
+    out = dict(result)
+    if not include_papers:
+        out.pop("papers", None)
+    return out
 
 
 def item_type_fields(client: ZoteroClient, item_type: str) -> tuple[set[str], str]:
@@ -1594,6 +1871,217 @@ def upload_attachment_file(client: ZoteroClient, attachment_key: str, pdf: Path,
     )
 
 
+def load_metadata_file(path_value: str) -> dict[str, Any]:
+    path = Path(path_value).expanduser().resolve()
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ZPPError(f"Cannot read metadata JSON {path}: {exc}", code="metadata_read_failed") from exc
+    if not isinstance(metadata, dict) or not str(metadata.get("title") or "").strip():
+        raise ZPPError("Metadata JSON must be an object containing at least `title`", code="metadata_invalid")
+    return metadata
+
+
+def strip_markup(value: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", value or ""))).strip()
+
+
+def crossref_metadata(doi_value: str) -> dict[str, Any]:
+    doi = normalize_doi(doi_value)
+    if not doi or not re.match(r"^10\.\d{4,9}/\S+$", doi):
+        raise ZPPError(f"Invalid DOI: {doi_value}", code="invalid_doi")
+    url = f"{CROSSREF_BASE_URL}/works/{urllib.parse.quote(doi, safe='')}"
+    mailto = os.environ.get("ZPP_CROSSREF_MAILTO", "").strip()
+    agent = "ZoteroProjectPapers/0.4.0"
+    if mailto:
+        agent += f" (mailto:{mailto})"
+    req = urllib.request.Request(url, headers={"User-Agent": agent, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        raise ZPPError(f"Crossref metadata lookup failed for {doi}: {exc}", code="crossref_lookup_failed") from exc
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, dict):
+        raise ZPPError(f"Crossref returned no work metadata for {doi}", code="crossref_no_metadata")
+    ctype = str(message.get("type") or "")
+    item_type = {
+        "journal-article": "journalArticle", "proceedings-article": "conferencePaper",
+        "book-chapter": "bookSection", "posted-content": "preprint", "report": "report",
+        "dissertation": "thesis",
+    }.get(ctype, "journalArticle")
+    title_list = message.get("title") or []
+    title = strip_markup(str(title_list[0])) if title_list else ""
+    creators = []
+    for author in message.get("author") or []:
+        if not isinstance(author, dict):
+            continue
+        creators.append({
+            "creatorType": "author", "firstName": str(author.get("given") or ""),
+            "lastName": str(author.get("family") or author.get("name") or ""),
+        })
+    date_parts = None
+    for key in ("published-print", "published-online", "issued", "created"):
+        block = message.get(key)
+        if isinstance(block, dict) and block.get("date-parts"):
+            date_parts = block.get("date-parts")
+            break
+    date = ""
+    if isinstance(date_parts, list) and date_parts and isinstance(date_parts[0], list):
+        parts = [str(x) for x in date_parts[0][:3]]
+        if parts:
+            date = "-".join(x.zfill(2) if i else x for i, x in enumerate(parts))
+    container = message.get("container-title") or []
+    venue = strip_markup(str(container[0])) if container else ""
+    metadata: dict[str, Any] = {
+        "itemType": item_type, "title": title or doi, "creators": creators, "date": date,
+        "DOI": str(message.get("DOI") or doi), "url": str(message.get("URL") or f"https://doi.org/{doi}"),
+        "abstractNote": strip_markup(str(message.get("abstract") or "")),
+        "volume": str(message.get("volume") or ""), "issue": str(message.get("issue") or ""),
+        "pages": str(message.get("page") or ""), "publisher": str(message.get("publisher") or ""),
+        "ISSN": ", ".join(str(x) for x in (message.get("ISSN") or [])),
+    }
+    if item_type == "conferencePaper":
+        metadata["proceedingsTitle"] = venue
+        event = message.get("event")
+        if isinstance(event, dict):
+            metadata["conferenceName"] = str(event.get("name") or venue)
+    elif item_type == "bookSection":
+        metadata["bookTitle"] = venue
+    else:
+        metadata["publicationTitle"] = venue
+    metadata = {k: v for k, v in metadata.items() if v not in (None, "", [], {})}
+    links = []
+    for link in message.get("link") or []:
+        if isinstance(link, dict) and link.get("URL"):
+            links.append({k: link.get(k) for k in ("URL", "content-type", "content-version", "intended-application") if link.get(k)})
+    return {"metadata": metadata, "source": "crossref", "doi": doi, "links": links}
+
+
+def source_trust(url: str) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").casefold()
+    trusted = any(host == x or host.endswith("." + x) for x in TRUSTED_PAPER_HOSTS)
+    return {
+        "scheme": parsed.scheme.casefold(), "host": host,
+        "knownAcademicHost": trusted,
+        "accessRights": "not-verified",
+    }
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def validate_pdf_file(path: Path, *, content_type: str = "") -> dict[str, Any]:
+    size = path.stat().st_size
+    if size < 1024:
+        raise ZPPError(f"Downloaded file is too small to be a paper PDF ({size} bytes).", code="invalid_pdf")
+    with path.open("rb") as f:
+        head = f.read(8)
+        f.seek(max(0, size - 4096))
+        tail = f.read()
+    if not head.startswith(b"%PDF-"):
+        raise ZPPError("Downloaded content does not start with a PDF header.", code="invalid_pdf")
+    if b"%%EOF" not in tail:
+        raise ZPPError("Downloaded PDF appears truncated (EOF marker missing near file end).", code="invalid_pdf")
+    # Lightweight, dependency-free estimate; not used as a correctness guarantee.
+    raw = path.read_bytes() if size <= 50 * 1024 * 1024 else b""
+    page_estimate = len(re.findall(br"/Type\s*/Page\b", raw)) if raw else None
+    return {
+        "validPdf": True, "validationLevel": "stdlib-lightweight", "sizeBytes": size,
+        "contentType": content_type, "sha256": sha256_file(path), "pageCountEstimate": page_estimate,
+        "note": "Page count/title validation is intentionally lightweight without a PDF parsing dependency.",
+    }
+
+
+def download_pdf(url: str, output: Path, *, allow_untrusted: bool = False, max_bytes: int = 500 * 1024 * 1024) -> dict[str, Any]:
+    trust = source_trust(url)
+    if trust["scheme"] != "https":
+        raise ZPPError("fetch accepts HTTPS paper URLs only.", code="unsafe_download_url")
+    if not trust["knownAcademicHost"] and not allow_untrusted:
+        raise ZPPError(
+            f"Refusing an unrecognized paper host: {trust['host']}", code="untrusted_paper_host",
+            hint="Prefer an official/open-access paper URL, or explicitly use --allow-untrusted after verifying the source.",
+            details=trust,
+        )
+    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.4.0", "Accept": "application/pdf,*/*;q=0.5"})
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output.with_suffix(output.suffix + ".part")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, tmp.open("wb") as f:
+            final_url = resp.geturl()
+            final_trust = source_trust(final_url)
+            if not final_trust["knownAcademicHost"] and not allow_untrusted:
+                raise ZPPError(f"Download redirected to an unrecognized host: {final_trust['host']}", code="untrusted_redirect", details=final_trust)
+            content_type = str(resp.headers.get("Content-Type") or "").split(";", 1)[0].strip().casefold()
+            total = 0
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ZPPError("Downloaded file exceeds the configured maximum size.", code="download_too_large")
+                f.write(chunk)
+        validation = validate_pdf_file(tmp, content_type=content_type)
+        tmp.replace(output)
+        return {"url": url, "finalUrl": final_url, "output": str(output), "source": final_trust, "validation": validation}
+    except Exception:
+        try:
+            if tmp.exists(): tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def import_metadata_record(client: ZoteroClient, root: Path, config: dict[str, Any], metadata: dict[str, Any], *, update_existing: bool = False) -> dict[str, Any]:
+    duplicates = find_duplicates(client, metadata)
+    if duplicates:
+        duplicate = duplicates[0]
+        key = str(item_summary(duplicate, brief=True)["key"])
+        diff = metadata_diff(duplicate, metadata)
+        update = update_existing_metadata(client, key, metadata) if update_existing and diff else None
+        changed = add_item_to_collection(client, key, config["collectionKey"])
+        sync = sync_project(client, root, config, prune=False)
+        record = next((p for p in sync["papers"] if p.get("itemKey") == key), None)
+        return {
+            "action": "reused-existing", "itemKey": key, "addedToCollection": changed,
+            "metadataDiff": diff, "metadataUpdate": update, "paper": record,
+            "pdfStatus": (record or {}).get("pdfStatus", "unknown"),
+            "duplicateItemKeys": [item_summary(x, brief=True)["key"] for x in duplicates],
+        }
+    client.ensure_write_auth(require_remembered=True)
+    item = build_item_from_metadata(client, metadata, config["collectionKey"])
+    key = client.create_item(item)
+    sync = sync_project(client, root, config, prune=False)
+    record = next((p for p in sync["papers"] if p.get("itemKey") == key), None)
+    return {"action": "imported-metadata", "itemKey": key, "paper": record, "pdfStatus": "missing"}
+
+
+def attach_pdf_to_item(client: ZoteroClient, root: Path, config: dict[str, Any], item_key: str, pdf: Path, *, allow_multiple: bool = False) -> dict[str, Any]:
+    obj = get_item(client, item_key)
+    existing = [a for a in pdf_attachments(client, item_key) if a.get("path")]
+    if existing and not allow_multiple:
+        return {"action": "existing-pdf", "itemKey": item_key, "attachments": existing, "note": "Existing PDF preserved; use --allow-multiple only when a second PDF attachment is intentional."}
+    client.ensure_write_auth(require_remembered=True)
+    metadata = item_data(obj)
+    attachment_key, filename = create_imported_attachment(client, item_key, pdf, metadata)
+    upload_attachment_file(client, attachment_key, pdf, filename)
+    reference_dir = (root / config["referenceDir"]).resolve()
+    absorbed = False
+    if is_within(pdf, reference_dir) and pdf.exists():
+        pdf.unlink()
+        absorbed = True
+    sync = sync_project(client, root, config, prune=False)
+    record = next((p for p in sync["papers"] if p.get("itemKey") == item_key), None)
+    return {"action": "attached-pdf", "itemKey": item_key, "attachmentKey": attachment_key, "attachmentFilename": filename, "absorbedLocalReference": absorbed, "paper": record}
+
+
 # ---------- Commands ----------
 
 
@@ -1651,72 +2139,156 @@ def find_zotero_executable() -> str | None:
 
 def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
     root = project_root(requested_project_root(args))
-    checks: list[dict[str, Any]] = []
+    diagnosis = "unknown"
+    zotero_running = False
+    local_api_enabled = False
+    server_id_detected = False
+    zotero_version: str | None = None
+    api_version: str | None = None
+    server_id: str | None = None
+    http_status: int | None = None
+    response_headers: list[str] = []
+    write_authorized = False
     client = ZoteroClient()
+    api_error: dict[str, Any] | None = None
+    auth_store_read_error: dict[str, Any] | None = None
+
     try:
-        client.bootstrap()
-        checks.append({"name": "zotero-local-api", "ok": True, "serverID": client.server_id, "apiVersion": client.api_version})
-        checks.append({
-            "name": "write-authorization",
-            "ok": bool(client.api_key),
-            "status": "authorized" if client.api_key else "not-authorized",
-            "hint": None if client.api_key else "Run `authorize` when a write operation is needed, then choose Always Allow in Zotero.",
-        })
-        try:
-            fields = client.read("itemTypeFields", {"itemType": "journalArticle"}) or []
-            checks.append({
-                "name": "item-schema",
-                "ok": bool(fields),
-                "strategy": "itemTypeFields" if fields else "builtin-fallback",
-                "hint": None if fields else "Dynamic item fields were unavailable; common imports will use the built-in conservative schema.",
-            })
-        except ZPPError as schema_exc:
-            checks.append({
-                "name": "item-schema",
-                "ok": True,
-                "strategy": "builtin-fallback",
-                "warning": schema_exc.as_dict(),
-                "hint": "The skill can still import common paper types using its built-in conservative schema.",
-            })
-        try:
-            client.read("items/new", {"itemType": "journalArticle"})
-            checks.append({"name": "items-new-template", "ok": True, "supported": True, "required": False})
-        except ZPPError as template_exc:
-            checks.append({
-                "name": "items-new-template",
-                "ok": True,
-                "supported": False,
-                "required": False,
-                "note": "This Zotero Local API does not expose /items/new. v0.3.0 does not depend on it.",
-                "detail": template_exc.as_dict(),
-            })
+        result = client._raw_request("GET", "")
+        http_status = result.status
+        zotero_running = True
+        zotero_version = result.header("X-Zotero-Version")
+        api_version = result.header("Zotero-API-Version")
+        server_id = result.header("Zotero-Server-ID")
+        server_id_detected = bool(server_id)
+        local_api_enabled = result.status == 200 and bool(server_id or api_version)
+        response_headers = sorted(result.headers.keys())
+        if server_id:
+            client.server_id = server_id
+            client.api_version = api_version
+            try:
+                store = load_auth_store()
+                client.api_key = (store.get("servers", {}).get(server_id, {}) or {}).get("key")
+            except ZPPError as auth_exc:
+                client.api_key = None
+                auth_store_read_error = auth_exc.as_dict()
+            write_authorized = bool(client.api_key)
+            diagnosis = "ready" if write_authorized else "authorization_required"
+        else:
+            diagnosis = "unexpected_local_api_response"
+        if zotero_version:
+            major_match = re.match(r"(\d+)", zotero_version)
+            if major_match and int(major_match.group(1)) < 10:
+                diagnosis = "zotero_version_unsupported"
     except ZPPError as exc:
-        checks.append({"name": "zotero-local-api", "ok": False, "error": exc.as_dict()})
+        api_error = exc.as_dict()
+        details = exc.details or {}
+        headers = details.get("headers") if isinstance(details, dict) else {}
+        if isinstance(headers, dict):
+            zotero_version = headers.get("x-zotero-version")
+            api_version = headers.get("zotero-api-version")
+            response_headers = sorted(headers.keys())
+        http_status = details.get("status") if isinstance(details, dict) else None
+        if exc.code == "zotero_http_403":
+            zotero_running = True
+            local_api_enabled = False
+            diagnosis = "local_api_disabled"
+        elif exc.code == "zotero_unreachable":
+            diagnosis = "zotero_unreachable"
+        else:
+            zotero_running = bool(zotero_version or http_status)
+            diagnosis = "local_api_error"
 
-    config_path = root / CONFIG_NAME
-    project_check = {
-        "name": "project-root",
-        "ok": True,
-        "path": str(root),
-        "initialized": config_path.exists(),
-        "hint": None if config_path.exists() else "Run `init` from the intended project root before project-scoped operations.",
-    }
-    if not config_path.exists():
-        project_check["referenceCandidates"] = detect_reference_dirs(root)
-    checks.append(project_check)
-    executable = find_zotero_executable()
-    checks.append({
-        "name": "zotero-executable",
-        "ok": bool(executable),
-        "path": executable,
-        "hint": None if executable else "Zotero executable was not found in common locations; this is informational if Zotero is already running.",
-    })
+    # Connector ping is informational and helps distinguish "Zotero process exists"
+    # from a proxy/other service bound to the Local API port. It never changes settings.
+    connector_ping: dict[str, Any] | None = None
+    if not zotero_version:
+        parsed_base = urllib.parse.urlsplit(client.base_url)
+        ping_url = f"{parsed_base.scheme}://{parsed_base.netloc}/connector/ping"
+        try:
+            ping = client._raw_request("GET", ping_url, absolute=True, timeout=3)
+            ping_version = ping.header("X-Zotero-Version")
+            connector_ping = {"ok": ping.status == 200, "status": ping.status, "xZoteroVersion": ping_version}
+            if ping_version:
+                zotero_version = ping_version
+                zotero_running = True
+        except ZPPError as ping_exc:
+            connector_ping = {"ok": False, "error": ping_exc.as_dict()}
+
+    auth_store = auth_store_preflight(create=True)
+    read_ready = bool(local_api_enabled and server_id_detected and diagnosis not in {"zotero_version_unsupported"})
+    if read_ready and not auth_store.get("writable"):
+        diagnosis = "read_ready_write_auth_store_unwritable"
+    write_ready = bool(read_ready and write_authorized and auth_store.get("writable"))
+
+    project_initialized = (root / CONFIG_NAME).exists()
+    project_collection_exists: bool | None = None
+    project_collection_key: str | None = None
+    reference_dir: str | None = None
+    legacy_dirs: list[dict[str, Any]] = []
+    if project_initialized:
+        try:
+            _, cfg = load_project(root)
+            assert cfg is not None
+            project_collection_key = str(cfg.get("collectionKey") or "") or None
+            reference_dir = str(cfg.get("referenceDir") or "") or None
+            legacy_dirs = possible_legacy_reference_dirs(root, reference_dir or "")
+            if server_id and project_collection_key:
+                try:
+                    obj = client.read(f"users/0/collections/{project_collection_key}")
+                    project_collection_exists = isinstance(obj, dict)
+                except ZPPError:
+                    project_collection_exists = False
+        except ZPPError:
+            pass
+    else:
+        legacy_dirs = detect_reference_dirs(root)
+
+    checks = [
+        {"name": "zotero-process-or-http-service", "ok": zotero_running, "version": zotero_version},
+        {"name": "local-api", "ok": local_api_enabled, "httpStatus": http_status},
+        {"name": "server-id", "ok": server_id_detected, "serverID": server_id, "requiredForWrites": True},
+        {"name": "auth-store", **auth_store},
+        {"name": "write-authorization", "ok": write_authorized, "storedKeyPresent": write_authorized},
+        {"name": "project-root", "ok": True, "path": str(root), "initialized": project_initialized},
+        {"name": "project-collection", "ok": project_collection_exists if project_collection_exists is not None else True, "key": project_collection_key, "exists": project_collection_exists},
+    ]
+
     return {
-        "ok": all(c.get("ok") for c in checks if c["name"] in {"zotero-local-api", "project-root"}),
+        "ok": read_ready,
+        "readReady": read_ready,
+        "writeReady": write_ready,
+        "diagnosis": diagnosis,
+        "zoteroRunning": zotero_running,
+        "zoteroVersion": zotero_version,
+        "localApiEnabled": local_api_enabled,
+        "httpStatus": http_status,
+        "apiVersion": api_version,
+        "serverIdDetected": server_id_detected,
+        "serverID": server_id,
+        "writeAuthorized": write_authorized,
+        "writeAuthorizationStatus": "stored-key-present" if write_authorized else "not-stored-or-not-authorized",
+        "authStore": {**auth_store, "readError": auth_store_read_error},
         "projectRoot": str(root),
+        "projectInitialized": project_initialized,
+        "projectCollectionKey": project_collection_key,
+        "projectCollectionExists": project_collection_exists,
+        "activeReferenceDir": reference_dir,
+        "possibleLegacyReferenceDirs": legacy_dirs,
+        "responseHeaders": response_headers,
+        "connectorPing": connector_ping,
+        "error": api_error,
         "checks": checks,
+        "nextAction": {
+            "ready": "continue",
+            "authorization_required": "authorize only when a write is needed",
+            "local_api_disabled": "ask the user to enable Zotero local application communication; do not use GUI automation unless explicitly requested",
+            "zotero_unreachable": "ask the user to start Zotero or verify the local API port",
+            "unexpected_local_api_response": "do not change Zotero settings automatically; inspect port/version/proxy response",
+            "zotero_version_unsupported": "upgrade to Zotero 10+ before using write features",
+            "read_ready_write_auth_store_unwritable": "read/search is available; set ZPP_AUTH_STORE to a writable private path before any write/authorization",
+        }.get(diagnosis, "inspect the structured diagnostics; do not modify Zotero settings automatically"),
     }
-
 
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
     client = ZoteroClient()
@@ -1728,22 +2300,29 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         "zoteroServerID": client.server_id,
         "zoteroApiVersion": client.api_version,
         "writeAuthorized": bool(client.api_key),
+        "authStore": str(auth_path()),
         "projectRoot": str(root),
         "projectInitialized": bool(config),
-        "project": config,
+        "collection": config.get("collectionPath") if config else None,
+        "referenceDir": config.get("referenceDir") if config else None,
     }
-
 
 def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args))
     assert config is not None
 
-    # v0.3 fast path: when local files/manifest and the cached Zotero library version
+    # v0.4 fast path: when local files/manifest and the cached Zotero library version
     # are unchanged, reuse the last full consistency result without touching Zotero.
     quick = quick_project_marker(root, config)
     sync_cfg = config.get("sync") if isinstance(config.get("sync"), dict) else default_sync_config()
     previous_quick = sync_cfg.get("quickFingerprint")
     last_full_clean = sync_cfg.get("lastFullClean")
+    quick_out = quick if getattr(args, "verbose", False) else {
+        "fingerprint": quick["fingerprint"],
+        "localPdfCount": len(quick.get("pdfs") or []),
+        "cachedLibraryVersion": quick.get("cachedLibraryVersion"),
+    }
+    legacy_dirs = possible_legacy_reference_dirs(root, str(config.get("referenceDir") or ""))
     if not args.full and previous_quick == quick["fingerprint"] and last_full_clean is not None:
         if bool(last_full_clean):
             recommendation = "continue"
@@ -1763,7 +2342,8 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
             "recommendation": recommendation,
             "checkMode": "quick-cache-hit",
             "zoteroContacted": False,
-            "quick": quick,
+            "quick": quick_out,
+            "possibleLegacyReferenceDirs": legacy_dirs,
         }
 
     client = ZoteroClient()
@@ -1796,7 +2376,8 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
         "recommendation": recommendation,
         "checkMode": "full" if args.full else "full-after-marker-change",
         "zoteroContacted": True,
-        "quick": quick,
+        "quick": quick_out,
+        "possibleLegacyReferenceDirs": legacy_dirs,
         "consistency": snapshot,
     }
 
@@ -1991,7 +2572,7 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
     if onboarding == "merge" and existing_dir:
         merged = flatten_reference_pdfs(root / existing_dir, root / reference_dir, args.fallback)
 
-    result = sync_project(client, root, config, prune=False)
+    result = compact_sync_result(sync_project(client, root, config, prune=False), include_papers=False)
     result.update({
         "initialized": True,
         "existing": False,
@@ -2010,7 +2591,7 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
     # Fastest path: current-project manifest. No Zotero process/API call at all.
     if args.scope == "project" and config is not None and not args.fulltext:
         local_hits = search_manifest(root, config, args.query, args.limit)
-        if local_hits:
+        if local_hits and float(local_hits[0].get("score") or 0) >= 0.55:
             return {
                 "scope": args.scope,
                 "query": args.query,
@@ -2053,19 +2634,13 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
                 collection_key=collection_key,
                 verbose=args.verbose,
             )
-            if cached:
+            if cached and float(cached[0].get("score") or 0) >= 0.55:
                 return {
-                    "scope": args.scope,
-                    "query": args.query,
-                    "count": len(cached),
-                    "source": "zotero-metadata-cache",
-                    "searchMode": "cached-metadata",
-                    "zoteroContacted": True,
-                    "webNeeded": False,
-                    "cache": cache_info,
+                    "scope": args.scope, "query": args.query, "count": len(cached),
+                    "source": "zotero-metadata-cache", "searchMode": "cached-metadata",
+                    "zoteroContacted": True, "webNeeded": False, "cache": cache_info,
                     "latencyMs": round((perf_counter() - started) * 1000, 2),
-                    "items": cached,
-                    "warnings": [],
+                    "items": cached, "warnings": [],
                 }
         except ZPPError as exc:
             cache_error = str(exc)
@@ -2076,39 +2651,37 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
             return collection_items(client, config["collectionKey"], args.query, fulltext)
         return library_search(client, args.query, fulltext, args.limit)
 
-    # When there is no cache, direct Local API metadata search is the fast path. It avoids
-    # a whole-library download and is still local-only. If it misses, fall back to Zotero's
-    # indexed `everything` search, which can match abstracts and PDF full text.
+    # When there is no strong cache hit, direct Local API metadata search is the next
+    # fast path. "Non-empty" is not enough: weak/irrelevant rows must not suppress the
+    # indexed full-text fallback.
     if args.fulltext:
         rows = run_zotero(True)
-        used_fulltext = True
+        summaries = rank_zotero_rows(rows, args.query, fulltext=True, limit=args.limit, verbose=args.verbose)
         source = "zotero-fulltext"
+        used_fulltext = True
     else:
-        rows = run_zotero(False)
-        used_fulltext = False
-        source = "zotero-direct-metadata"
-        if not rows and not args.no_fulltext_fallback:
+        metadata_rows = run_zotero(False)
+        metadata_summaries = rank_zotero_rows(metadata_rows, args.query, fulltext=False, limit=args.limit, verbose=args.verbose)
+        metadata_strong = bool(metadata_summaries) and float(metadata_summaries[0].get("score") or 0) >= 0.55
+        if metadata_strong or args.no_fulltext_fallback:
+            rows = metadata_rows
+            summaries = metadata_summaries
+            source = "zotero-direct-metadata"
+            used_fulltext = False
+        else:
             rows = run_zotero(True)
-            used_fulltext = True
+            summaries = rank_zotero_rows(rows, args.query, fulltext=True, limit=args.limit, verbose=args.verbose)
             source = "zotero-fulltext"
+            used_fulltext = True
 
-    selected = rows[: args.limit]
-    summaries = [item_summary(x, brief=not args.verbose) for x in selected]
+    strong = bool(summaries) and float(summaries[0].get("score") or 0) >= 0.55
     return {
-        "scope": args.scope,
-        "query": args.query,
-        "count": len(summaries),
-        "source": source,
+        "scope": args.scope, "query": args.query, "count": len(summaries), "source": source,
         "searchMode": "everything" if used_fulltext else "titleCreatorYear",
-        "zoteroContacted": True,
-        "webNeeded": len(summaries) == 0,
-        "cache": cache_info,
-        "cacheError": cache_error,
-        "latencyMs": round((perf_counter() - started) * 1000, 2),
-        "items": summaries,
-        "warnings": duplicate_warnings(selected),
+        "zoteroContacted": True, "webNeeded": not strong, "cache": cache_info, "cacheError": cache_error,
+        "latencyMs": round((perf_counter() - started) * 1000, 2), "items": summaries,
+        "warnings": duplicate_warnings(rows),
     }
-
 
 def cmd_cache(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args), required=False)
@@ -2161,7 +2734,7 @@ def cmd_sync(args: argparse.Namespace) -> dict[str, Any]:
     assert config is not None
     client = ZoteroClient()
     client.bootstrap()
-    return sync_project(client, root, config, prune=args.prune)
+    return compact_sync_result(sync_project(client, root, config, prune=args.prune), include_papers=bool(getattr(args, "include_papers", False)))
 
 
 def cmd_fulltext(args: argparse.Namespace) -> dict[str, Any] | str:
@@ -2192,6 +2765,162 @@ def cmd_fulltext(args: argparse.Namespace) -> dict[str, Any] | str:
     return content
 
 
+def cmd_import_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    metadata = load_metadata_file(args.metadata)
+    client = ZoteroClient()
+    client.bootstrap()
+    result = import_metadata_record(
+        client, root, config, metadata,
+        update_existing=bool(getattr(args, "update_existing_metadata", False)),
+    )
+    result["metadataSource"] = "file"
+    return result
+
+
+def cmd_attach_pdf(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    pdf = Path(args.pdf).expanduser().resolve()
+    if not pdf.is_file() or pdf.suffix.casefold() != ".pdf":
+        raise ZPPError(f"PDF not found or not a .pdf file: {pdf}", code="pdf_missing")
+    validate_pdf_file(pdf)
+    client = ZoteroClient()
+    client.bootstrap()
+    return attach_pdf_to_item(client, root, config, args.item_key, pdf, allow_multiple=bool(args.allow_multiple))
+
+
+def cmd_import_doi(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    looked_up = crossref_metadata(args.doi)
+    client = ZoteroClient()
+    client.bootstrap()
+    result = import_metadata_record(
+        client, root, config, looked_up["metadata"],
+        update_existing=bool(getattr(args, "update_existing_metadata", False)),
+    )
+    result.update({"metadataSource": "crossref", "DOI": looked_up["doi"], "pdfCandidates": looked_up["links"][:5]})
+    return result
+
+
+def cmd_enrich(args: argparse.Namespace) -> dict[str, Any]:
+    client = ZoteroClient()
+    client.bootstrap()
+    obj = get_item(client, args.item_key)
+    existing = item_data(obj)
+    doi = normalize_doi(str(existing.get("DOI") or ""))
+    if not doi:
+        raise ZPPError(
+            f"Item {args.item_key} has no DOI; automatic Crossref enrichment is unavailable.",
+            code="doi_missing",
+            hint="Add/verify the DOI first, or update metadata manually from an authoritative source.",
+        )
+    looked_up = crossref_metadata(doi)
+    incoming = looked_up["metadata"]
+    diff = metadata_diff(obj, incoming)
+    result: dict[str, Any] = {
+        "itemKey": args.item_key, "DOI": doi, "source": "crossref", "metadataDiff": diff,
+        "applied": False, "pdfCandidates": looked_up["links"][:5],
+    }
+    if args.apply and diff:
+        update = update_existing_metadata(client, args.item_key, incoming)
+        result["applied"] = bool(update.get("updated"))
+        result["metadataUpdate"] = update
+    return result
+
+
+def cmd_fetch(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.output and not args.import_to_zotero:
+        raise ZPPError("fetch requires --output unless --import is used.", code="fetch_output_required")
+    metadata = load_metadata_file(args.metadata) if args.metadata else None
+    if args.import_to_zotero and metadata is None:
+        raise ZPPError("fetch --import requires --metadata.", code="metadata_required")
+    cleanup = False
+    if args.output:
+        output = Path(args.output).expanduser().resolve()
+    else:
+        output = Path(tempfile.gettempdir()) / f"zpp-{uuid.uuid4().hex}.pdf"
+        cleanup = True
+    download = download_pdf(args.url, output, allow_untrusted=bool(args.allow_untrusted))
+    result: dict[str, Any] = {"action": "fetched", **download}
+    if args.import_to_zotero:
+        ns = argparse.Namespace(
+            project_root=getattr(args, "project_root", None), pdf=str(output), metadata=args.metadata,
+            update_existing_metadata=bool(args.update_existing_metadata), json=True,
+        )
+        result["zotero"] = cmd_import_pdf(ns)
+        result["action"] = "fetched-and-imported"
+    if cleanup:
+        try:
+            if output.exists(): output.unlink()
+        except OSError:
+            pass
+        result["temporaryFileRemoved"] = True
+    return result
+
+
+def cmd_tag(args: argparse.Namespace) -> dict[str, Any]:
+    client = ZoteroClient()
+    client.bootstrap()
+    obj = get_item(client, args.item_key)
+    d = item_data(obj)
+    tags = [x for x in (d.get("tags") or []) if isinstance(x, dict) and x.get("tag")]
+    existing = {str(x.get("tag")) for x in tags}
+    changed = False
+    if args.remove:
+        new_tags = [x for x in tags if str(x.get("tag")) != args.tag]
+        changed = len(new_tags) != len(tags)
+    else:
+        new_tags = list(tags)
+        if args.tag not in existing:
+            new_tags.append({"tag": args.tag})
+            changed = True
+    if changed:
+        client.write(
+            "PATCH", f"users/0/items/{args.item_key}", json_body={"tags": new_tags},
+            extra_headers={"If-Unmodified-Since-Version": str(d.get("version", 0))},
+        )
+    return {"itemKey": args.item_key, "tag": args.tag, "removed": bool(args.remove), "changed": changed}
+
+
+def cmd_organize(args: argparse.Namespace) -> dict[str, Any]:
+    """Create project child collections from a small JSON topic map.
+
+    Format: {"topics": {"Topic A": ["ITEMKEY1", "ITEMKEY2"]}}
+    """
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    path = Path(args.map).expanduser().resolve()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ZPPError(f"Cannot read topic map {path}: {exc}", code="topic_map_invalid") from exc
+    topics = data.get("topics") if isinstance(data, dict) else None
+    if not isinstance(topics, dict):
+        raise ZPPError('Topic map must be JSON like {"topics": {"Topic": ["ITEMKEY"]}}.', code="topic_map_invalid")
+    client = ZoteroClient()
+    client.bootstrap()
+    created: dict[str, Any] = {}
+    for topic, keys in topics.items():
+        if not isinstance(topic, str) or not isinstance(keys, list):
+            continue
+        found = find_collection(client, topic, config["collectionKey"])
+        child_key = str(found.get("key")) if found else client.create_collection(topic, config["collectionKey"])
+        added = []
+        for key in keys:
+            key = str(key)
+            # Keep every topic paper in the main project collection as well.
+            add_item_to_collection(client, key, config["collectionKey"])
+            if add_item_to_collection(client, key, child_key):
+                added.append(key)
+        created[topic] = {"collectionKey": child_key, "itemCount": len(keys), "newlyAdded": added}
+    topic_out = root / "papers" / "topics.json"
+    json_dump({"generatedAt": utc_now(), "topics": created}, topic_out)
+    return {"ok": True, "projectRoot": str(root), "topicIndex": relpath_for_manifest(topic_out, root), "topics": created}
+
+
 def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args))
     assert config is not None
@@ -2200,13 +2929,8 @@ def cmd_import_pdf(args: argparse.Namespace) -> dict[str, Any]:
         raise ZPPError(f"PDF not found: {pdf}")
     if pdf.suffix.casefold() != ".pdf":
         raise ZPPError("import-pdf accepts .pdf files only")
-    metadata_path = Path(args.metadata).expanduser().resolve()
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise ZPPError(f"Cannot read metadata JSON {metadata_path}: {exc}") from exc
-    if not isinstance(metadata, dict) or not str(metadata.get("title") or "").strip():
-        raise ZPPError("Metadata JSON must be an object containing at least `title`")
+    validate_pdf_file(pdf)
+    metadata = load_metadata_file(args.metadata)
 
     client = ZoteroClient()
     client.bootstrap()
@@ -2297,7 +3021,7 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.3.0")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.4.0")
     p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -2313,6 +3037,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ack-continue", action="store_true", help="Remember the current drift fingerprint and continue without prompting until it changes")
     s.add_argument("--reset-policy", action="store_true", help="Forget any remembered continue decision and prompt again while drift remains")
     s.add_argument("--full", action="store_true", help="Force a full Zotero/manifest/reference consistency comparison")
+    s.add_argument("--verbose", action="store_true", help="Include file-level quick-marker details")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_check)
 
@@ -2373,6 +3098,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("sync", help="Materialize current project collection and regenerate manifest/BibTeX")
     s.add_argument("--prune", action="store_true", help="Remove stale helper-managed project files only")
+    s.add_argument("--include-papers", action="store_true", help="Include the full paper array; default JSON is a compact sync summary")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_sync)
 
@@ -2387,6 +3113,53 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-chars", type=int, default=100000)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_fulltext)
+
+    s = sub.add_parser("import-metadata", help="Create/reuse a Zotero bibliographic item without requiring a PDF")
+    s.add_argument("metadata", help="UTF-8 Zotero-style metadata JSON; title is required")
+    s.add_argument("--update-existing-metadata", action="store_true", help="Update non-empty fields only when an existing duplicate has the same item type")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_import_metadata)
+
+    s = sub.add_parser("attach-pdf", help="Attach a validated local PDF to an existing Zotero bibliographic item")
+    s.add_argument("item_key")
+    s.add_argument("pdf")
+    s.add_argument("--allow-multiple", action="store_true", help="Allow another PDF even when the item already has a stored PDF")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_attach_pdf)
+
+    s = sub.add_parser("import-doi", help="Fetch Crossref metadata for a DOI and create/reuse a metadata-only project item")
+    s.add_argument("doi")
+    s.add_argument("--update-existing-metadata", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_import_doi)
+
+    s = sub.add_parser("enrich", help="Preview or apply DOI-based Crossref metadata enrichment for an existing item")
+    s.add_argument("item_key")
+    s.add_argument("--apply", action="store_true", help="Apply non-empty fields when item type is unchanged")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_enrich)
+
+    s = sub.add_parser("fetch", help="Download and lightweight-validate a PDF from a known academic HTTPS source")
+    s.add_argument("url")
+    s.add_argument("--output", help="Destination PDF; optional when --import is used")
+    s.add_argument("--metadata", help="Metadata JSON; required for --import")
+    s.add_argument("--import", dest="import_to_zotero", action="store_true", help="After validation, import the PDF into Zotero/current project")
+    s.add_argument("--allow-untrusted", action="store_true", help="Allow a host outside the built-in academic-host allowlist after explicit source verification")
+    s.add_argument("--update-existing-metadata", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_fetch)
+
+    s = sub.add_parser("tag", help="Add or remove one Zotero tag on a paper")
+    s.add_argument("item_key")
+    s.add_argument("tag")
+    s.add_argument("--remove", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_tag)
+
+    s = sub.add_parser("organize", help="Create project child collections from a JSON topic map")
+    s.add_argument("map", help='JSON file: {"topics": {"Topic": ["ITEMKEY", ...]}}')
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_organize)
 
     s = sub.add_parser("import-pdf", help="Import a selected PDF + metadata JSON into Zotero and current project")
     s.add_argument("pdf")

@@ -72,7 +72,7 @@ class UtilsTests(unittest.TestCase):
                 self.assertTrue(os.path.samefile(src, dst))
 
 
-    def test_config_v1_migrates_to_v3(self):
+    def test_config_v1_migrates_to_v4(self):
         cfg = zpp.normalize_project_config({
             "schemaVersion": 1,
             "collectionPath": "Projects/Test",
@@ -82,7 +82,7 @@ class UtilsTests(unittest.TestCase):
             "bibFile": "papers/references.bib",
             "fallback": "copy",
         })
-        self.assertEqual(cfg["schemaVersion"], 3)
+        self.assertEqual(cfg["schemaVersion"], 4)
         self.assertEqual(cfg["sync"]["driftPolicy"], "prompt")
 
     def test_detect_reference_dirs_with_subdirs(self):
@@ -438,6 +438,182 @@ class UtilsTests(unittest.TestCase):
                 else: os.environ["XDG_CACHE_HOME"] = old_xdg
                 if old_local is None: os.environ.pop("LOCALAPPDATA", None)
                 else: os.environ["LOCALAPPDATA"] = old_local
+
+    def test_http_headers_are_case_insensitive(self):
+        r = zpp.HTTPResult(200, {"Zotero-Server-Id": "SERVER1", "Content-Type": "application/json"}, b"{}")
+        self.assertEqual(r.header("Zotero-Server-ID"), "SERVER1")
+        self.assertEqual(r.header("content-type"), "application/json")
+
+    def test_classify_match_prefers_exact_title_over_abstract(self):
+        exact = zpp.classify_match({"title": "Progressive Cross Scale Semantic Alignment"}, "Progressive cross-scale semantic alignment")
+        weak = zpp.classify_match({"title": "Other Method", "abstractNote": "We discuss progressive cross scale semantic alignment."}, "Progressive cross-scale semantic alignment")
+        self.assertEqual(exact["matchType"], "normalized-title-exact")
+        self.assertGreater(exact["score"], weak["score"])
+        self.assertEqual(weak["matchType"], "abstract-token")
+
+    def test_classify_match_doi_exact(self):
+        m = zpp.classify_match({"title": "Whatever", "DOI": "10.1234/ABC"}, "https://doi.org/10.1234/abc")
+        self.assertEqual(m["matchType"], "doi-exact")
+        self.assertEqual(m["score"], 1.0)
+
+    def test_auth_store_override_is_writable(self):
+        with tempfile.TemporaryDirectory() as td:
+            old = os.environ.get("ZPP_AUTH_STORE")
+            try:
+                os.environ["ZPP_AUTH_STORE"] = str(Path(td) / "private" / "auth.json")
+                status = zpp.auth_store_preflight(create=True)
+                self.assertTrue(status["writable"])
+                self.assertTrue(status["path"].endswith("auth.json"))
+            finally:
+                if old is None: os.environ.pop("ZPP_AUTH_STORE", None)
+                else: os.environ["ZPP_AUTH_STORE"] = old
+
+    def test_metadata_only_import_marks_missing_pdf(self):
+        class FakeClient:
+            def ensure_write_auth(self, require_remembered=True):
+                self.authed = True
+            def read(self, path, params=None):
+                if path == "itemTypeFields":
+                    return [{"field": "title"}, {"field": "DOI"}]
+                raise AssertionError(path)
+            def create_item(self, item):
+                self.created = item
+                return "ITEMNEW1"
+        client = FakeClient()
+        original_dup = zpp.find_duplicates
+        original_sync = zpp.sync_project
+        try:
+            zpp.find_duplicates = lambda client, metadata: []
+            zpp.sync_project = lambda client, root, config, prune=False: {
+                "papers": [{"itemKey": "ITEMNEW1", "title": "Paper", "pdfStatus": "missing", "projectPath": None}]
+            }
+            cfg = {"collectionKey": "COLL1"}
+            out = zpp.import_metadata_record(client, Path("."), cfg, {"itemType": "journalArticle", "title": "Paper", "DOI": "10.1/x"})
+            self.assertEqual(out["action"], "imported-metadata")
+            self.assertEqual(out["pdfStatus"], "missing")
+            self.assertEqual(client.created["collections"], ["COLL1"])
+        finally:
+            zpp.find_duplicates = original_dup
+            zpp.sync_project = original_sync
+
+    def test_validate_pdf_lightweight(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "x.pdf"
+            p.write_bytes(b"%PDF-1.4\n" + b"x" * 1100 + b"\n/Type /Page\n%%EOF\n")
+            out = zpp.validate_pdf_file(p, content_type="application/pdf")
+            self.assertTrue(out["validPdf"])
+            self.assertEqual(len(out["sha256"]), 64)
+
+    def test_possible_legacy_reference_dir(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "papers" / "references").mkdir(parents=True)
+            (root / "papers" / "references" / "old.pdf").write_bytes(b"x")
+            rows = zpp.possible_legacy_reference_dirs(root, "papers/reference")
+            self.assertTrue(any(r["path"] == "papers/references" for r in rows))
+
+
+    def test_doctor_accepts_server_id_header_case_variant(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_auth = os.environ.get("ZPP_AUTH_STORE")
+            try:
+                os.environ["ZPP_AUTH_STORE"] = str(Path(td) / "auth.json")
+                class FakeClient:
+                    base_url = "http://127.0.0.1:23119/api/"
+                    server_id = None
+                    api_version = None
+                    api_key = None
+                    def _raw_request(self, method, path_or_url, **kwargs):
+                        return zpp.HTTPResult(200, {
+                            "Zotero-Server-Id": "SERVER1",
+                            "Zotero-API-Version": "3",
+                            "X-Zotero-Version": "10.0.1",
+                        }, b"{}")
+                    def read(self, path, params=None):
+                        raise AssertionError(path)
+                original = zpp.ZoteroClient
+                try:
+                    zpp.ZoteroClient = FakeClient
+                    args = type("Args", (), {"project_root": td})()
+                    out = zpp.cmd_doctor(args)
+                finally:
+                    zpp.ZoteroClient = original
+                self.assertTrue(out["serverIdDetected"])
+                self.assertTrue(out["localApiEnabled"])
+                self.assertEqual(out["zoteroVersion"], "10.0.1")
+                self.assertEqual(out["diagnosis"], "authorization_required")
+            finally:
+                if old_auth is None: os.environ.pop("ZPP_AUTH_STORE", None)
+                else: os.environ["ZPP_AUTH_STORE"] = old_auth
+
+    def test_compact_sync_result_hides_papers(self):
+        data = {"paperCount": 2, "papers": [{"itemKey": "A"}, {"itemKey": "B"}]}
+        self.assertNotIn("papers", zpp.compact_sync_result(data))
+        self.assertIn("papers", zpp.compact_sync_result(data, include_papers=True))
+
+
+    def test_weak_metadata_results_fall_back_to_fulltext(self):
+        with tempfile.TemporaryDirectory() as td:
+            class FakeClient:
+                def __init__(self):
+                    self.server_id = None
+                def bootstrap(self):
+                    self.server_id = "SERVER-NOCACHE"
+            original_client = zpp.ZoteroClient
+            original_search = zpp.library_search
+            original_cache_status = zpp.cache_status
+            try:
+                zpp.ZoteroClient = FakeClient
+                zpp.cache_status = lambda server_id: {"exists": False, "libraryVersion": None}
+                def fake_search(client, query, fulltext=False, limit=30):
+                    if not fulltext:
+                        return [{"data": {"key": "WEAK1", "itemType": "journalArticle", "title": "Unrelated Work", "creators": []}}]
+                    return [{"data": {"key": "FULL1", "itemType": "journalArticle", "title": "Another Work", "creators": []}}]
+                zpp.library_search = fake_search
+                args = type("Args", (), {
+                    "project_root": td, "scope": "library", "query": "rare internal phrase",
+                    "fulltext": False, "no_fulltext_fallback": False, "verbose": False,
+                    "refresh_cache": False, "limit": 10,
+                })()
+                out = zpp.cmd_search(args)
+                self.assertEqual(out["source"], "zotero-fulltext")
+                self.assertEqual(out["items"][0]["matchType"], "zotero-fulltext")
+            finally:
+                zpp.ZoteroClient = original_client
+                zpp.library_search = original_search
+                zpp.cache_status = original_cache_status
+
+
+    def test_crossref_metadata_mapping(self):
+        import json as _json
+        payload = {"message": {
+            "type": "proceedings-article",
+            "title": ["A Conference Paper"],
+            "author": [{"given": "Ada", "family": "Lovelace"}],
+            "issued": {"date-parts": [[2026, 5, 1]]},
+            "container-title": ["Proceedings of Example Conference"],
+            "DOI": "10.1234/example",
+            "URL": "https://doi.org/10.1234/example",
+            "page": "1-10",
+        }}
+        class Resp:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self): return _json.dumps(payload).encode()
+        original = zpp.urllib.request.urlopen
+        try:
+            zpp.urllib.request.urlopen = lambda req, timeout=30: Resp()
+            out = zpp.crossref_metadata("10.1234/example")
+        finally:
+            zpp.urllib.request.urlopen = original
+        self.assertEqual(out["metadata"]["itemType"], "conferencePaper")
+        self.assertEqual(out["metadata"]["proceedingsTitle"], "Proceedings of Example Conference")
+        self.assertEqual(out["metadata"]["creators"][0]["lastName"], "Lovelace")
+
+    def test_source_trust_known_academic_host(self):
+        self.assertTrue(zpp.source_trust("https://openaccess.thecvf.com/paper.pdf")["knownAcademicHost"])
+        self.assertFalse(zpp.source_trust("https://example.invalid/paper.pdf")["knownAcademicHost"])
+
 
 if __name__ == "__main__":
     unittest.main()

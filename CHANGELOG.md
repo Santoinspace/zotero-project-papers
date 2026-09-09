@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.4.0 — Robust Local API, Metadata-Only Evidence, Better Matching
+
+### P0 compatibility and diagnosis
+
+- Fixed Zotero response-header handling by normalizing HTTP header names case-insensitively (`Zotero-Server-Id` and `Zotero-Server-ID` are equivalent).
+- Reworked `doctor --json` into layered diagnostics for unreachable Zotero, disabled Local API, missing/unsupported server identity, write authorization, auth-store writability, project binding, and project collection presence.
+- Added optional `/connector/ping` diagnostics for version/service identification without changing Zotero settings.
+- Explicitly prevents uncertain diagnostics from escalating to GUI/computer-use changes.
+- Added `ZPP_AUTH_STORE` for sandbox-friendly write-key persistence. Authorization persistence is preflighted before opening Zotero's approval dialog.
+- Authorization results now distinguish `authorizationGranted`, `remembered`, and `tokenPersisted`.
+
+### Metadata-only evidence and PDF attachment
+
+- Added `import-metadata` so a paper can enter Zotero/current project without a PDF.
+- Added `attach-pdf ITEM_KEY paper.pdf` to attach a stored PDF later.
+- Project manifest records `pdfStatus=available|missing`, separating the evidence set from the local PDF set.
+- Added `import-doi` and `enrich` using Crossref metadata. Existing-item type conflicts remain conservative and are never silently rewritten.
+
+### Search and deduplication quality
+
+- Search results now expose `matchType`, `matchedFields`, and normalized `score`.
+- Matching priority is DOI exact → arXiv exact → normalized title exact → title phrase → title token / author+year → venue/tags → abstract/full-text fallback.
+- Weak abstract-only matches no longer short-circuit more reliable local/full-text/web lookup.
+- Duplicate detection now follows DOI → arXiv ID → normalized title → strict title+first-author+year.
+- Title normalization treats punctuation/hyphens as boundaries for more stable exact matching.
+- Metadata cache now stores arXiv ID/extra fields and migrates existing SQLite caches in place.
+
+### Fetch and metadata quality
+
+- Added conservative `fetch` for HTTPS academic PDF URLs with redirect checks, PDF header/EOF/size validation, SHA-256, and host classification.
+- The helper does not claim to verify copyright/access rights and refuses unfamiliar hosts by default unless explicitly overridden after verification.
+- New DOI enrichment reduces hand-written venue/DOI/date metadata.
+
+### Agent-token efficiency and project UX
+
+- `sync --json` is compact by default; use `--include-papers` for the full paper array.
+- `check --json` hides per-file quick-marker details unless `--verbose` is requested.
+- `check` reports possible legacy reference directories such as `papers/references` when the active directory is different.
+- Added optional `tag` and JSON-based `organize` commands for research-question tags and project child collections.
+- Project config schema upgraded to v4; older configs migrate automatically.
+
 ## 0.3.0 — Activation & Fast Search
 
 ### Activation
