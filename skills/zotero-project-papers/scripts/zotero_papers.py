@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.5.1
+"""zotero-project-papers v0.5.2
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -490,6 +490,12 @@ class ZoteroClient:
                     "url": url,
                     "headers": normalize_http_headers(exc.headers.items()) if exc.headers else {},
                     "body": detail[:500],
+                    "userAction": (
+                        {"type": "enable_local_api", "message": "In Zotero, enable Settings → Advanced → Allow other applications on this computer to communicate with Zotero."}
+                        if exc.code == 403 and "local/authorize" not in url else
+                        {"type": "approve_write_authorization", "message": "A Zotero write authorization is required. Keep Zotero open and approve the dialog; choose Always Allow to avoid repeated prompts."}
+                        if exc.code == 401 else None
+                    ),
                 },
             ) from exc
         except urllib.error.URLError as exc:
@@ -503,7 +509,8 @@ class ZoteroClient:
             raise ZPPError(
                 f"Cannot reach Zotero Local API at {self.base_url}: {reason}.",
                 code="zotero_unreachable",
-                hint="Make sure Zotero 10+ is running and local application communication is enabled.",
+                hint="Open Zotero and retry. If Zotero is already open, verify Settings → Advanced → Allow other applications on this computer to communicate with Zotero.",
+                details={"userAction": {"type": "start_zotero", "message": "Please open Zotero, keep it running, and retry the blocked Zotero operation."}},
             ) from exc
         except (TimeoutError, socket.timeout) as exc:
             raise ZPPError(
@@ -1277,30 +1284,71 @@ def pdf_attachments(client: ZoteroClient, item_key: str) -> list[dict[str, Any]]
 
 
 def collection_items(client: ZoteroClient, collection_key: str, query: str | None = None, fulltext: bool = False) -> list[dict[str, Any]]:
+    # Search top-level bibliographic items directly. Filtering child attachments only
+    # after applying a small API limit can produce a false zero-result set.
     params: dict[str, Any] = {"limit": 100}
     if query:
         params["q"] = query
         params["qmode"] = "everything" if fulltext else "titleCreatorYear"
-    rows = client.read(f"users/0/collections/{collection_key}/items", params) or []
-    out = []
+    rows = client.read(f"users/0/collections/{collection_key}/items/top", params) or []
+    return [obj for obj in rows if item_data(obj).get("itemType") not in {"attachment", "note", "annotation"}]
+
+
+def _promote_search_rows_to_top_level(client: ZoteroClient, rows: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Promote attachment/note full-text hits to their parent bibliographic items.
+
+    This is only a compatibility fallback for Local API builds where `items/top`
+    does not surface a child attachment's indexed-text match.
+    """
+    direct: list[dict[str, Any]] = []
+    parent_keys: list[str] = []
+    seen: set[str] = set()
     for obj in rows:
         d = item_data(obj)
-        if d.get("itemType") not in {"attachment", "note", "annotation"}:
-            out.append(obj)
-    return out
+        typ = d.get("itemType")
+        key = str(d.get("key") or obj.get("key") or "")
+        if typ not in {"attachment", "note", "annotation"}:
+            if key and key not in seen:
+                direct.append(obj)
+                seen.add(key)
+            continue
+        parent = str(d.get("parentItem") or "")
+        if parent and parent not in seen and parent not in parent_keys:
+            parent_keys.append(parent)
+    for start in range(0, len(parent_keys), 50):
+        batch = parent_keys[start:start + 50]
+        if not batch:
+            continue
+        parents = client.read("users/0/items/top", {"itemKey": ",".join(batch), "limit": len(batch)}) or []
+        for obj in parents:
+            d = item_data(obj)
+            key = str(d.get("key") or obj.get("key") or "")
+            if key and key not in seen:
+                direct.append(obj)
+                seen.add(key)
+                if len(direct) >= limit:
+                    return direct[:limit]
+    return direct[:limit]
 
 
 def library_search(client: ZoteroClient, query: str, fulltext: bool = False, limit: int = 30) -> list[dict[str, Any]]:
-    rows = client.read(
+    # `/items` includes child attachments and notes. Applying `limit` before filtering
+    # them can make a healthy library look empty. `/items/top` is the correct endpoint
+    # for bibliographic-paper search.
+    params = {"q": query, "qmode": "everything" if fulltext else "titleCreatorYear", "limit": min(limit, 100)}
+    rows = client.read("users/0/items/top", params) or []
+    out = [obj for obj in rows if item_data(obj).get("itemType") not in {"attachment", "note", "annotation"}]
+    if out or not fulltext:
+        return out[:limit]
+
+    # Compatibility fallback: some Local API quicksearch implementations can expose
+    # the matching child attachment rather than its parent when searching indexed text.
+    # Query a bounded all-items set and promote child hits to their parent papers.
+    raw = client.read(
         "users/0/items",
-        {"q": query, "qmode": "everything" if fulltext else "titleCreatorYear", "limit": min(limit, 100)},
+        {"q": query, "qmode": "everything", "limit": min(max(limit * 10, 50), 100)},
     ) or []
-    out = []
-    for obj in rows:
-        d = item_data(obj)
-        if d.get("itemType") not in {"attachment", "note", "annotation"}:
-            out.append(obj)
-    return out
+    return _promote_search_rows_to_top_level(client, raw, limit)
 
 
 def rank_zotero_rows(rows: list[dict[str, Any]], query: str, *, fulltext: bool, limit: int, verbose: bool = False) -> list[dict[str, Any]]:
@@ -2190,7 +2238,7 @@ def crossref_metadata(doi_value: str) -> dict[str, Any]:
         raise ZPPError(f"Invalid DOI: {doi_value}", code="invalid_doi")
     url = f"{CROSSREF_BASE_URL}/works/{urllib.parse.quote(doi, safe='')}"
     mailto = os.environ.get("ZPP_CROSSREF_MAILTO", "").strip()
-    agent = "ZoteroProjectPapers/0.5.1"
+    agent = "ZoteroProjectPapers/0.5.2"
     if mailto:
         agent += f" (mailto:{mailto})"
     req = urllib.request.Request(url, headers={"User-Agent": agent, "Accept": "application/json"})
@@ -2307,7 +2355,7 @@ def download_pdf(url: str, output: Path, *, allow_untrusted: bool = False, max_b
             hint="Prefer an official/open-access paper URL, or explicitly use --allow-untrusted after verifying the source.",
             details=trust,
         )
-    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.5.1", "Accept": "application/pdf,*/*;q=0.5"})
+    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.5.2", "Accept": "application/pdf,*/*;q=0.5"})
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_suffix(output.suffix + ".part")
     try:
@@ -2579,13 +2627,22 @@ def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
         "checks": checks,
         "nextAction": {
             "ready": "continue",
-            "authorization_required": "authorize only when a write is needed",
+            "authorization_required": "read/search can continue; immediately before the first write, tell the user Zotero will show a permission dialog, then run authorize and ask them to choose Always Allow (recommended) or Allow for one-time access",
             "local_api_disabled": "ask the user to enable Zotero local application communication; do not use GUI automation unless explicitly requested",
-            "zotero_unreachable": "ask the user to start Zotero or verify the local API port",
+            "zotero_unreachable": "ask the user to open Zotero, keep it running, and retry the blocked Zotero operation",
             "unexpected_local_api_response": "do not change Zotero settings automatically; inspect port/version/proxy response",
             "zotero_version_unsupported": "upgrade to Zotero 10+ before using write features",
             "read_ready_write_auth_store_unwritable": "read/search is available; set ZPP_AUTH_STORE to a writable private path before any write/authorization",
         }.get(diagnosis, "inspect the structured diagnostics; do not modify Zotero settings automatically"),
+        "userInteraction": (
+            {"required": True, "type": "start_zotero", "message": "Please open Zotero and keep it running, then retry."}
+            if diagnosis == "zotero_unreachable" else
+            {"required": False, "type": "write_authorization_later", "message": "No action is needed for read-only search. Before the first write, Zotero will show an authorization dialog; choose Always Allow to avoid repeated prompts."}
+            if diagnosis == "authorization_required" else
+            {"required": True, "type": "enable_local_api", "message": "Enable Zotero Settings → Advanced → Allow other applications on this computer to communicate with Zotero."}
+            if diagnosis == "local_api_disabled" else
+            {"required": False, "type": None, "message": None}
+        ),
     }
 
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
@@ -2973,13 +3030,19 @@ def cmd_search(args: argparse.Namespace) -> dict[str, Any]:
             used_fulltext = True
 
     strong = bool(summaries) and float(summaries[0].get("score") or 0) >= 0.55
-    return {
+    result = {
         "scope": args.scope, "query": args.query, "count": len(summaries), "source": source,
         "searchMode": "everything" if used_fulltext else "titleCreatorYear",
         "zoteroContacted": True, "webNeeded": not strong, "cache": cache_info, "cacheError": cache_error,
         "latencyMs": round((perf_counter() - started) * 1000, 2), "items": summaries,
         "warnings": duplicate_warnings(rows),
     }
+    if not summaries:
+        result["zeroResultNote"] = (
+            "No indexed local match was found. For topic/concept queries, this is not proof that the Zotero library contains no relevant paper; "
+            "treat it as a local-search miss and continue the retrieval ladder. Exact DOI/arXiv/title checks are stronger absence signals."
+        )
+    return result
 
 def cmd_cache(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args), required=False)
@@ -3462,7 +3525,7 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.5.1")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.5.2")
     p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.2
+
+- Fixed false-zero whole-library searches by querying Zotero top-level bibliographic items (`/items/top`) instead of limiting `/items` and filtering child attachments afterward.
+- Added a bounded full-text compatibility fallback that promotes matching child attachments/notes to their parent bibliographic items.
+- Added regression coverage for the attachment-limit false-zero bug.
+- Clarified zero-result semantics: a conceptual search miss is not proof that Zotero contains no relevant paper.
+- Added structured user-action hints for Zotero-unreachable, Local API disabled, and write-authorization states.
+- Updated Skill behavior and README so agents ask users to open Zotero only when needed and warn immediately before the first Zotero write-authorization dialog.
+- No schema change and no manual migration required for existing projects.
+
 ## 0.5.1 — Backward-Compatible Upgrades & User-Facing README
 
 ### Upgrade compatibility

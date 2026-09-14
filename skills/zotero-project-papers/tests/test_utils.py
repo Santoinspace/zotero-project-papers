@@ -585,6 +585,72 @@ class UtilsTests(unittest.TestCase):
                 zpp.cache_status = original_cache_status
 
 
+    def test_library_search_uses_top_level_endpoint_to_avoid_false_zero(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+            def read(self, path, params=None, raw=False):
+                self.calls.append((path, params))
+                if path == "users/0/items/top":
+                    return [{"data": {"key": "PAPER001", "itemType": "journalArticle", "title": "Missing Modality Study", "creators": []}}]
+                if path == "users/0/items":
+                    # This simulates the old bug: a small /items limit can be consumed by child attachments.
+                    return [{"data": {"key": "ATTACH01", "itemType": "attachment", "parentItem": "PAPER001", "title": "PDF"}}]
+                return []
+        client = FakeClient()
+        rows = zpp.library_search(client, "missing modality", fulltext=False, limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(zpp.item_data(rows[0])["key"], "PAPER001")
+        self.assertEqual(client.calls[0][0], "users/0/items/top")
+        self.assertFalse(any(path == "users/0/items" for path, _ in client.calls))
+
+    def test_library_fulltext_fallback_promotes_child_attachment_to_parent(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+            def read(self, path, params=None, raw=False):
+                self.calls.append((path, params))
+                if path == "users/0/items/top" and params and params.get("q"):
+                    return []
+                if path == "users/0/items":
+                    return [{"data": {"key": "ATTACH01", "itemType": "attachment", "parentItem": "PAPER001", "title": "PDF"}}]
+                if path == "users/0/items/top" and params and params.get("itemKey") == "PAPER001":
+                    return [{"data": {"key": "PAPER001", "itemType": "journalArticle", "title": "A Parent Paper", "creators": []}}]
+                return []
+        client = FakeClient()
+        rows = zpp.library_search(client, "rare phrase", fulltext=True, limit=10)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(zpp.item_data(rows[0])["key"], "PAPER001")
+        self.assertTrue(any(path == "users/0/items" for path, _ in client.calls))
+
+    def test_zero_library_search_explains_non_absence(self):
+        with tempfile.TemporaryDirectory() as td:
+            class FakeClient:
+                def __init__(self):
+                    self.server_id = None
+                def bootstrap(self):
+                    self.server_id = "SERVER-ZERO"
+            original_client = zpp.ZoteroClient
+            original_search = zpp.library_search
+            original_cache_status = zpp.cache_status
+            try:
+                zpp.ZoteroClient = FakeClient
+                zpp.cache_status = lambda server_id: {"exists": False, "libraryVersion": None}
+                zpp.library_search = lambda client, query, fulltext=False, limit=30: []
+                args = type("Args", (), {
+                    "project_root": td, "scope": "library", "query": "broad research concept",
+                    "fulltext": False, "no_fulltext_fallback": False, "verbose": False,
+                    "refresh_cache": False, "limit": 10,
+                })()
+                out = zpp.cmd_search(args)
+                self.assertEqual(out["count"], 0)
+                self.assertIn("not proof", out["zeroResultNote"])
+                self.assertTrue(out["webNeeded"])
+            finally:
+                zpp.ZoteroClient = original_client
+                zpp.library_search = original_search
+                zpp.cache_status = original_cache_status
+
     def test_crossref_metadata_mapping(self):
         import json as _json
         payload = {"message": {

@@ -1,9 +1,9 @@
 ---
 name: zotero-project-papers
 description: Use only when the user explicitly asks to find, search, survey, retrieve, or reference academic papers/literature; explicitly asks for top-conference/top-journal papers; explicitly asks to use Zotero or the project's reference papers; explicitly asks for an answer grounded in actual papers; or explicitly asks to audit whether citations/papers support claims. Do not activate merely because a technical question could benefit from citations, because the user asks whether something "has been studied", or for ordinary design/coding/review discussion without an explicit literature-retrieval or citation-audit request. When activated, search the current project and local Zotero first, use web only as needed, archive papers actually used as evidence, and preserve claim provenance when citation verification is requested.
-compatibility: Requires Zotero 10+ running locally with local application communication enabled and Python 3.10+. Designed for coding agents that can run local Python scripts; web search is supplied by the host agent.
+compatibility: Requires Python 3.10+. Zotero 10+ with local application communication enabled is required only when a Zotero-backed read/write operation is needed. Designed for coding agents that can run local Python scripts; web search is supplied by the host agent.
 metadata:
-  version: "0.5.1"
+  version: "0.5.2"
 ---
 
 # Zotero Project Papers
@@ -70,11 +70,22 @@ only after selecting a likely candidate, and read the PDF/full text only for pap
 
 ## Requirements
 
-- Zotero 10+ is installed and running.
+- Zotero 10+ is installed. Zotero only needs to be running when a Zotero-backed read/write operation is actually needed; a project-manifest fast-path can work without opening Zotero.
 - Zotero Settings → Advanced → **Allow other applications on this computer to communicate with Zotero** is enabled.
 - Python 3.10+ is available.
 - The helper is stdlib-only.
 - Import does not require `GET /items/new`.
+
+## User-visible Zotero interaction
+
+Keep Zotero interaction predictable and low-friction:
+
+- Do **not** ask the user to open Zotero merely because the Skill activated. First use the project-local fast path when possible.
+- When a Zotero-backed operation is required and the helper returns `zotero_unreachable`, stop that operation and tell the user clearly: **“请先打开 Zotero，并保持运行；打开后我会继续。”** Retry after the user opens it. Do not silently skip straight to Web search if local-first lookup was requested.
+- Read-only Zotero search requires no write authorization. Do not show or request the write dialog just to search.
+- Before the **first operation that will modify Zotero** when persistent authorization is not already known, send a short user-visible notice **before** invoking authorization: **“接下来 Zotero 会弹出写入授权窗口，请在 Zotero 中点击 Always Allow（推荐；Allow 仅本次也可以）。”** Then run `$ZPP authorize --json` and wait for the user's Zotero action.
+- Do not repeatedly remind the user about authorization after a remembered key exists. A `401` means the remembered/single-use authorization is missing or expired; explain that Zotero will ask again and re-authorize.
+- Never use computer-use to click the authorization dialog or change Zotero settings unless the user explicitly asks for GUI automation.
 
 Resolve `scripts/zotero_papers.py` relative to this `SKILL.md`, but **keep the shell working directory at the user's project**. Invoke the helper by absolute path. If necessary pass `--project-root <path>` before the subcommand.
 
@@ -106,6 +117,8 @@ Only after the activation policy is satisfied, perform one consistency preflight
 When diagnosing Zotero, trust the structured `doctor --json` result. It distinguishes `zotero_unreachable`, `local_api_disabled`, `authorization_required`, `auth_store_unwritable`, unsupported versions, and unexpected responses. **Never launch computer-use/GUI automation to change Zotero settings merely because a header is missing or a diagnosis is uncertain.** Only use GUI automation if the user explicitly asks for it.
 
 HTTP response headers are case-insensitive; do not infer failure from `ID` vs `Id` spelling.
+
+A zero-result local search is a **search miss, not a proof of absence**, especially for topic/concept queries. The helper already falls back from title/creator/year search to Zotero indexed full text. If both return zero, continue the retrieval ladder instead of telling the user “Zotero does not contain such papers”. Exact DOI, arXiv ID, and normalized-title checks are stronger evidence that a specific paper is absent.
 
 For sandboxed agents, write authorization persistence can be redirected before authorization:
 
@@ -524,10 +537,10 @@ Before literature-grounded writing, inspect supporting paper text rather than re
 
 Prefer `--json` for agent calls. Errors stay machine-readable and do not emit tracebacks unless `ZPP_DEBUG=1`.
 
-If write authorization is needed:
+If write authorization is needed, first send the user-visible reminder described above, then run:
 
 ```bash
 $ZPP authorize --json
 ```
 
-Tell the user to choose **Always Allow** in Zotero. The helper waits up to 300 seconds.
+The helper waits up to 300 seconds. Recommend **Always Allow** so later project updates do not keep interrupting the user; **Allow** is valid for one-time access.

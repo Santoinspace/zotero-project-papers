@@ -106,6 +106,19 @@ papers actually used as evidence
 Zotero project collection + project reference directory
 ```
 
+### When Zotero needs your attention
+
+You do **not** need to open Zotero for every conversation. If the answer can be served from the current project's `papers.json`, the Skill stays entirely local to the project.
+
+When the Skill actually needs to search or update your Zotero library:
+
+- if Zotero is closed, the agent should ask you to **open Zotero and keep it running**, then retry;
+- read-only search does **not** need write authorization;
+- on the first Zotero write, Zotero may show a permission dialog. The agent should warn you just before it appears. Choose **Always Allow** (recommended) to avoid repeated prompts, or **Allow** for one-time access;
+- the agent should never click this dialog or change Zotero settings through GUI automation unless you explicitly ask it to.
+
+This keeps normal project work quiet while making the moments that require Zotero interaction explicit.
+
 ## Project setup and existing reference folders
 
 The default reference directory is `papers/reference/`, but it is configurable. You can use `references/`, `literature/`, `papers/refs/`, or another project-relative path.
@@ -137,6 +150,8 @@ The search order is:
 ```
 
 Search output is brief by default and limited to a small candidate set. The agent should request details only for promising papers instead of dumping many abstracts into context.
+
+A local result count of `0` means **“no indexed match found”**, not automatically **“this library has no relevant paper”**. Topic/concept searches can miss wording variants or papers with incomplete indexing, so the agent should continue to the next retrieval layer rather than make a hard absence claim. DOI, arXiv ID, and exact-title checks are stronger signals for whether a specific paper already exists locally.
 
 For users who frequently search a large Zotero library, the metadata cache can be warmed once:
 
