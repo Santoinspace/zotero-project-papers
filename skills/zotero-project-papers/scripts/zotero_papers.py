@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.5.2
+"""zotero-project-papers v0.6.0
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -34,12 +34,13 @@ from typing import Any, Iterable
 APP_NAME = "Zotero Project Papers"
 BASE_URL = os.environ.get("ZOTERO_LOCAL_API", "http://127.0.0.1:23119/api/").rstrip("/") + "/"
 CONFIG_NAME = ".zotero-project.json"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 DEFAULT_COLLECTION_ROOT = "Projects"
 DEFAULT_REFERENCE_DIR = "papers/reference"
 DEFAULT_BIB_FILE = "papers/references.bib"
 MANIFEST_NAME = "papers.json"
 CLAIMS_FILE = "papers/claims.json"
+CITATIONS_FILE = "papers/citations.json"
 REFERENCE_CANDIDATES = ("reference", "references", "refs", "literature", "literatures", "papers/reference", "papers/references")
 AUTH_TIMEOUT = int(os.environ.get("ZPP_AUTH_TIMEOUT", "300"))
 CACHE_TTL_SECONDS = int(os.environ.get("ZPP_CACHE_TTL", "60"))
@@ -297,6 +298,7 @@ def normalize_project_config(config: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("manifestFile", (Path(out["referenceDir"]) / MANIFEST_NAME).as_posix())
     out.setdefault("bibFile", DEFAULT_BIB_FILE)
     out.setdefault("claimsFile", CLAIMS_FILE)
+    out.setdefault("citationsFile", CITATIONS_FILE)
     out.setdefault("fallback", "copy")
     out.setdefault("zoteroServerID", None)
     sync = default_sync_config()
@@ -1139,6 +1141,271 @@ def quick_project_marker(root: Path, config: dict[str, Any]) -> dict[str, Any]:
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {"fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(), **payload}
+
+
+# ---------- Citation provenance ----------
+
+
+def citations_path(root: Path, config: dict[str, Any]) -> Path:
+    return root / str(config.get("citationsFile") or CITATIONS_FILE)
+
+
+def load_citations(root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    path = citations_path(root, config)
+    if not path.exists():
+        return {
+            "schemaVersion": 1,
+            "managedBy": "zotero-project-papers",
+            "collectionPath": config.get("collectionPath"),
+            "collectionKey": config.get("collectionKey"),
+            "citations": {},
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ZPPError(
+            f"Cannot read citation provenance ledger {path}: {exc}",
+            code="citations_invalid",
+            hint="Fix or remove the invalid citations.json before recording or auditing citation provenance.",
+        ) from exc
+    if not isinstance(data, dict):
+        raise ZPPError(f"{path} must contain a JSON object", code="citations_invalid")
+    rows = data.get("citations")
+    if rows is None:
+        data["citations"] = {}
+    elif not isinstance(rows, dict):
+        raise ZPPError(f"{path}: citations must be an object keyed by Zotero item key", code="citations_invalid")
+    data.setdefault("schemaVersion", 1)
+    data.setdefault("managedBy", "zotero-project-papers")
+    data.pop("projectRoot", None)
+    data.setdefault("collectionPath", config.get("collectionPath"))
+    data.setdefault("collectionKey", config.get("collectionKey"))
+    return data
+
+
+def save_citations(root: Path, config: dict[str, Any], ledger: dict[str, Any]) -> Path:
+    ledger = dict(ledger)
+    ledger["schemaVersion"] = 1
+    ledger["managedBy"] = "zotero-project-papers"
+    ledger.pop("projectRoot", None)
+    ledger["collectionPath"] = config.get("collectionPath")
+    ledger["collectionKey"] = config.get("collectionKey")
+    ledger["updatedAt"] = utc_now()
+    path = citations_path(root, config)
+    json_dump(ledger, path)
+    return path
+
+
+def citation_source_rank(source_type: str) -> int:
+    return {
+        "publisher": 100,
+        "proceedings": 95,
+        "bibliographic-database": 85,
+        "doi-registry": 80,
+        "review-platform": 70,
+        "preprint-platform": 65,
+        "user-provided": 60,
+        "generated": 20,
+    }.get(source_type, 10)
+
+
+def bibtex_entry_key(raw: str) -> str | None:
+    match = re.search(r"@\w+\s*\{\s*([^,\s]+)", raw or "", flags=re.I)
+    return match.group(1).strip() if match else None
+
+
+def validate_bibtex_text(raw: str) -> dict[str, Any]:
+    text = (raw or "").strip()
+    if not text:
+        raise ZPPError("BibTeX content is empty.", code="bibtex_empty")
+    if not re.search(r"@\w+\s*[\{(]", text, flags=re.I):
+        raise ZPPError("Content does not appear to contain a BibTeX entry.", code="bibtex_invalid")
+    return {
+        "validBibtex": True,
+        "entryKey": bibtex_entry_key(text),
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "length": len(text),
+    }
+
+
+def doi_bibtex(doi_value: str) -> dict[str, Any]:
+    doi = normalize_doi(doi_value)
+    if not doi or not re.match(r"^10\.\d{4,9}/\S+$", doi):
+        raise ZPPError(f"Invalid DOI: {doi_value}", code="invalid_doi")
+    url = f"https://doi.org/{urllib.parse.quote(doi, safe='/()') }"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "ZoteroProjectPapers/0.6.0",
+            "Accept": "application/x-bibtex; charset=utf-8, text/bibliography;q=0.9, text/plain;q=0.5",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            ctype = str(resp.headers.get("Content-Type") or "")
+            final_url = resp.geturl()
+    except Exception as exc:
+        raise ZPPError(
+            f"DOI BibTeX content negotiation failed for {doi}: {exc}",
+            code="doi_bibtex_failed",
+            hint="Keep the Zotero citation as the fallback, or record publisher/DBLP BibTeX later if available.",
+        ) from exc
+    raw = body.decode("utf-8", errors="replace").strip()
+    validation = validate_bibtex_text(raw)
+    return {
+        "doi": doi,
+        "rawBibtex": raw,
+        "source": {
+            "type": "doi-registry",
+            "provider": "DOI content negotiation",
+            "url": url,
+            "finalUrl": final_url,
+            "contentType": ctype,
+            "retrievedAt": utc_now(),
+        },
+        "validation": validation,
+    }
+
+
+def fetch_bibtex_url(url: str, *, source_type: str, provider: str | None = None) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.casefold() != "https":
+        raise ZPPError("Citation source URL must use HTTPS.", code="unsafe_citation_url")
+    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.6.0", "Accept": "application/x-bibtex,text/plain;q=0.8,*/*;q=0.2"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace").strip()
+            final_url = resp.geturl()
+            ctype = str(resp.headers.get("Content-Type") or "")
+    except Exception as exc:
+        raise ZPPError(f"Could not fetch BibTeX from {url}: {exc}", code="citation_fetch_failed") from exc
+    validation = validate_bibtex_text(raw)
+    return {
+        "rawBibtex": raw,
+        "source": {
+            "type": source_type,
+            "provider": provider or urllib.parse.urlparse(final_url).netloc,
+            "url": url,
+            "finalUrl": final_url,
+            "contentType": ctype,
+            "retrievedAt": utc_now(),
+        },
+        "validation": validation,
+    }
+
+
+def record_citation_provenance(
+    root: Path,
+    config: dict[str, Any],
+    *,
+    item_key: str,
+    raw_bibtex: str,
+    source: dict[str, Any],
+    metadata_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    paper_index = project_paper_index(root, config)
+    if item_key not in paper_index:
+        raise ZPPError(
+            f"Item {item_key} is not in the current project manifest.",
+            code="citation_untracked_paper",
+            hint="Add/sync the paper into the project before recording citation provenance.",
+        )
+    validation = validate_bibtex_text(raw_bibtex)
+    ledger = load_citations(root, config)
+    rows = ledger.setdefault("citations", {})
+    existing = rows.get(item_key) if isinstance(rows.get(item_key), dict) else {}
+    sources = [x for x in (existing.get("sources") or []) if isinstance(x, dict)]
+    digest = validation["sha256"]
+    duplicate = next((x for x in sources if x.get("sha256") == digest and x.get("source", {}).get("type") == source.get("type")), None)
+    if duplicate:
+        return {
+            "recorded": False,
+            "duplicate": True,
+            "itemKey": item_key,
+            "citation": existing,
+            "citationsFile": relpath_for_manifest(citations_path(root, config), root),
+        }
+    row = {
+        "id": f"citation-{uuid.uuid4().hex[:12]}",
+        "source": source,
+        "rawBibtex": raw_bibtex.strip(),
+        "entryKey": validation.get("entryKey"),
+        "sha256": digest,
+        "retrievedAt": source.get("retrievedAt") or utc_now(),
+    }
+    sources.append(row)
+    sources.sort(key=lambda x: (-citation_source_rank(str((x.get("source") or {}).get("type") or "")), str(x.get("retrievedAt") or "")))
+    paper = paper_index[item_key]
+    citation_record = {
+        "itemKey": item_key,
+        "title": paper.get("title"),
+        "DOI": paper.get("DOI"),
+        "canonicalSource": "zotero",
+        "projectBibFile": config.get("bibFile"),
+        "sources": sources,
+    }
+    if metadata_snapshot:
+        citation_record["metadataSnapshot"] = metadata_snapshot
+    rows[item_key] = citation_record
+    path = save_citations(root, config, ledger)
+    return {
+        "recorded": True,
+        "duplicate": False,
+        "itemKey": item_key,
+        "preferredSource": sources[0].get("source") if sources else None,
+        "sourceCount": len(sources),
+        "citationsFile": relpath_for_manifest(path, root),
+    }
+
+
+def citation_audit_local(root: Path, config: dict[str, Any], *, include_entries: bool = False) -> dict[str, Any]:
+    ledger = load_citations(root, config)
+    papers = project_paper_index(root, config)
+    rows = ledger.get("citations") or {}
+    with_provenance = 0
+    missing: list[str] = []
+    weak_only: list[str] = []
+    doi_without_source: list[str] = []
+    details: list[dict[str, Any]] = []
+    for key, paper in papers.items():
+        record = rows.get(key) if isinstance(rows, dict) and isinstance(rows.get(key), dict) else None
+        sources = [x for x in ((record or {}).get("sources") or []) if isinstance(x, dict)]
+        if sources:
+            with_provenance += 1
+            best = sources[0]
+            best_type = str((best.get("source") or {}).get("type") or "generated")
+            if citation_source_rank(best_type) < citation_source_rank("doi-registry"):
+                weak_only.append(key)
+        else:
+            missing.append(key)
+            if normalize_doi(str(paper.get("DOI") or "")):
+                doi_without_source.append(key)
+            best = None
+        if include_entries:
+            details.append({
+                "itemKey": key,
+                "title": paper.get("title"),
+                "DOI": paper.get("DOI"),
+                "sourceCount": len(sources),
+                "preferredSource": (best or {}).get("source") if best else None,
+                "entryKey": (best or {}).get("entryKey") if best else None,
+            })
+    out = {
+        "citationsFile": relpath_for_manifest(citations_path(root, config), root),
+        "projectBibFile": config.get("bibFile"),
+        "paperCount": len(papers),
+        "withCitationProvenance": with_provenance,
+        "missingCitationProvenance": len(missing),
+        "missingItemKeys": missing,
+        "doiResolvableItemKeys": doi_without_source,
+        "weakOnlyItemKeys": weak_only,
+        "note": "Citation provenance audits source traceability. The project BibTeX remains Zotero-generated; raw source BibTeX is preserved separately and never silently replaces citation keys.",
+    }
+    if include_entries:
+        out["entries"] = details
+    return out
+
 
 
 # ---------- Zotero/project helpers ----------
@@ -2238,7 +2505,7 @@ def crossref_metadata(doi_value: str) -> dict[str, Any]:
         raise ZPPError(f"Invalid DOI: {doi_value}", code="invalid_doi")
     url = f"{CROSSREF_BASE_URL}/works/{urllib.parse.quote(doi, safe='')}"
     mailto = os.environ.get("ZPP_CROSSREF_MAILTO", "").strip()
-    agent = "ZoteroProjectPapers/0.5.2"
+    agent = "ZoteroProjectPapers/0.6.0"
     if mailto:
         agent += f" (mailto:{mailto})"
     req = urllib.request.Request(url, headers={"User-Agent": agent, "Accept": "application/json"})
@@ -2355,7 +2622,7 @@ def download_pdf(url: str, output: Path, *, allow_untrusted: bool = False, max_b
             hint="Prefer an official/open-access paper URL, or explicitly use --allow-untrusted after verifying the source.",
             details=trust,
         )
-    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.5.2", "Accept": "application/pdf,*/*;q=0.5"})
+    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.6.0", "Accept": "application/pdf,*/*;q=0.5"})
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_suffix(output.suffix + ".part")
     try:
@@ -2916,6 +3183,8 @@ def cmd_init(args: argparse.Namespace) -> dict[str, Any]:
         "referenceDir": Path(reference_dir).as_posix(),
         "manifestFile": manifest_file,
         "bibFile": bib_file,
+        "claimsFile": CLAIMS_FILE,
+        "citationsFile": CITATIONS_FILE,
         "fallback": args.fallback,
         "zoteroServerID": client.server_id,
         "sync": default_sync_config(),
@@ -3269,6 +3538,74 @@ def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
     return out
 
 
+
+def cmd_citation_resolve(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    paper_index = project_paper_index(root, config)
+    if args.item_key not in paper_index:
+        raise ZPPError(
+            f"Item {args.item_key} is not in the current project manifest.",
+            code="citation_untracked_paper",
+            hint="Add/sync the paper into the project first.",
+        )
+    paper = paper_index[args.item_key]
+    # Keep citation provenance local-first: papers.json already carries the
+    # bibliographic identity needed for DOI resolution, so Zotero does not need
+    # to be running merely to preserve a raw citation source.
+    summary = dict(paper)
+    doi = normalize_doi(str(paper.get("DOI") or ""))
+    if args.source_url:
+        fetched = fetch_bibtex_url(args.source_url, source_type=args.source_type, provider=args.provider)
+    else:
+        if not doi:
+            raise ZPPError(
+                f"Item {args.item_key} has no DOI for automatic citation resolution.",
+                code="citation_no_doi",
+                hint="Use citation-record with a publisher/DBLP BibTeX file, or enrich the Zotero item with a DOI first.",
+            )
+        fetched = doi_bibtex(doi)
+    snapshot = {
+        "title": summary.get("title"), "creators": summary.get("creators"),
+        "date": summary.get("date"), "DOI": summary.get("DOI"),
+        "publicationTitle": summary.get("publicationTitle"), "url": summary.get("url"),
+    }
+    result = record_citation_provenance(
+        root, config, item_key=args.item_key, raw_bibtex=fetched["rawBibtex"],
+        source=fetched["source"], metadata_snapshot=snapshot,
+    )
+    result["validation"] = fetched.get("validation")
+    result["resolution"] = "source-url" if args.source_url else "doi-content-negotiation"
+    return result
+
+
+def cmd_citation_record(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    path = Path(args.bibtex_file).expanduser().resolve()
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise ZPPError(f"Cannot read BibTeX file {path}: {exc}", code="bibtex_read_failed") from exc
+    source = {
+        "type": args.source_type,
+        "provider": args.provider or "user-provided",
+        "url": args.source_url,
+        "retrievedAt": utc_now(),
+        "recordedFrom": "bibtex-file",
+    }
+    return record_citation_provenance(
+        root, config, item_key=args.item_key, raw_bibtex=raw, source=source,
+    )
+
+
+def cmd_citation_audit(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    return citation_audit_local(root, config, include_entries=args.include_entries)
+
+
+
 def cmd_import_metadata(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args))
     assert config is not None
@@ -3525,7 +3862,7 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.5.2")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.6.0")
     p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -3642,6 +3979,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--include-claims", action="store_true", help="Include individual claim text/details; default output is a compact summary")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_audit)
+
+    s = sub.add_parser("citation-resolve", help="Capture raw citation/BibTeX provenance for a project evidence paper")
+    s.add_argument("item_key")
+    s.add_argument("--source-url", help="Optional direct HTTPS BibTeX endpoint; without it DOI content negotiation is used")
+    s.add_argument("--source-type", choices=["publisher", "proceedings", "bibliographic-database", "doi-registry", "review-platform", "preprint-platform", "user-provided"], default="publisher", help="Provenance class for --source-url")
+    s.add_argument("--provider", help="Human-readable source provider, e.g. CVF, DBLP, ACM DL")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_citation_resolve)
+
+    s = sub.add_parser("citation-record", help="Record a BibTeX file obtained from an official/proceedings/bibliographic source")
+    s.add_argument("item_key")
+    s.add_argument("bibtex_file")
+    s.add_argument("--source-type", required=True, choices=["publisher", "proceedings", "bibliographic-database", "doi-registry", "review-platform", "preprint-platform", "user-provided"])
+    s.add_argument("--source-url", help="Page/endpoint from which the BibTeX was obtained")
+    s.add_argument("--provider", help="Human-readable provider, e.g. IEEE Xplore, DBLP, OpenReview")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_citation_record)
+
+    s = sub.add_parser("citation-audit", help="Audit whether project papers have traceable raw citation provenance")
+    s.add_argument("--include-entries", action="store_true", help="Include per-paper citation-source summaries")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_citation_audit)
 
     s = sub.add_parser("import-metadata", help="Create/reuse a Zotero bibliographic item without requiring a PDF")
     s.add_argument("metadata", help="UTF-8 Zotero-style metadata JSON; title is required")

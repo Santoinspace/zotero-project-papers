@@ -26,6 +26,7 @@ class UpgradeCompatibilityTests(unittest.TestCase):
                     "manifestFile": "literature/custom-refs/index.json",
                     "bibFile": "manuscript/my-library.bib",
                     "claimsFile": "notes/evidence-ledger.json",
+                    "citationsFile": "notes/citation-provenance.json",
                     "fallback": "symlink",
                     "zoteroServerID": "server-existing",
                     "sync": {
@@ -39,7 +40,7 @@ class UpgradeCompatibilityTests(unittest.TestCase):
                 self.assertEqual(migrated["schemaVersion"], zpp.SCHEMA_VERSION)
                 for key in (
                     "collectionPath", "collectionKey", "referenceDir", "manifestFile",
-                    "bibFile", "claimsFile", "fallback", "zoteroServerID",
+                    "bibFile", "claimsFile", "citationsFile", "fallback", "zoteroServerID",
                 ):
                     self.assertEqual(migrated[key], original[key], key)
                 self.assertEqual(migrated["sync"]["state"], "diverged")
@@ -86,13 +87,24 @@ class UpgradeCompatibilityTests(unittest.TestCase):
             "search", "cache", "show", "resolve", "add", "sync", "reconcile",
             "fulltext", "evidence", "record-claim", "audit", "import-metadata",
             "attach-pdf", "import-doi", "enrich", "fetch", "tag", "organize",
-            "import-pdf",
+            "import-pdf", "citation-resolve", "citation-record", "citation-audit",
         }
         self.assertTrue(historical_commands.issubset(available), historical_commands - available)
 
-    def test_patch_release_does_not_bump_persisted_schema(self):
-        # v0.5.1 changes docs/release policy and compatibility tests, not persisted config.
-        self.assertEqual(zpp.SCHEMA_VERSION, 5)
+    def test_minor_release_adds_citation_ledger_via_automatic_schema_migration(self):
+        self.assertEqual(zpp.SCHEMA_VERSION, 6)
+        migrated = zpp.normalize_project_config({
+            "schemaVersion": 5,
+            "collectionPath": "Projects/Existing",
+            "collectionKey": "AAAA1111",
+            "referenceDir": "refs",
+            "manifestFile": "refs/papers.json",
+            "bibFile": "custom/references.bib",
+            "claimsFile": "custom/claims.json",
+        })
+        self.assertEqual(migrated["bibFile"], "custom/references.bib")
+        self.assertEqual(migrated["claimsFile"], "custom/claims.json")
+        self.assertEqual(migrated["citationsFile"], "papers/citations.json")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,14 @@ Evidence provenance
 original paper ──► AI summary ──► Agent inference ──► project claim / manuscript
       ▲                                                    │
       └──────── citation audit / source traceability ──────┘
+
+Citation provenance
+
+publisher / proceedings / DBLP / DOI
+                  ↓
+             raw BibTeX
+                  ↓
+                Zotero ──► papers/references.bib
 ```
 
 ## Core behavior
@@ -62,7 +70,7 @@ CC Switch is the recommended installer and updater.
 Updates are designed to be **in-place and backward compatible**:
 
 - existing `.zotero-project.json` files are migrated automatically when needed;
-- your configured reference directory, BibTeX path, and existing project binding are preserved;
+- your configured reference directory, BibTeX path, claim/citation ledgers, and existing project binding are preserved;
 - updates do not require you to manually move or delete papers;
 - an upgrade never treats a missing local PDF as permission to delete the Zotero item;
 - destructive cleanup still requires an explicit user action.
@@ -173,6 +181,26 @@ For an explicit literature task, the Skill should automatically:
 - import web-found papers actually used as evidence when reliable metadata/PDFs are available;
 - avoid importing the rest of the search candidates.
 
+## Citation provenance and BibTeX
+
+`papers/references.bib` remains Zotero-generated so existing LaTeX projects and citation keys do not suddenly change after an update. When a paper is actually used as project evidence, the Skill can also preserve the best available **raw citation/BibTeX source** in `papers/citations.json`.
+
+Preferred sources are official publisher/proceedings records, trusted bibliographic databases such as DBLP, then DOI content negotiation. If a site only exposes BibTeX through a browser download button, the downloaded `.bib` file can be recorded without replacing the project BibTeX.
+
+```text
+Publisher / proceedings / DBLP / DOI
+                  ↓
+          raw citation record
+                  ↓
+        papers/citations.json
+                  ↓
+        Zotero canonical metadata
+                  ↓
+        papers/references.bib
+```
+
+This gives you a traceable answer to **“where did this bibliography record come from?”** while keeping Zotero as the canonical library. Candidate search results are not fetched automatically; citation provenance is captured only for papers actually used as evidence.
+
 ## Evidence provenance and citation audit
 
 A real citation does not automatically mean the cited paper supports the sentence attached to it. Zotero Project Papers can keep a lightweight project evidence ledger in `papers/claims.json` and distinguish:
@@ -209,6 +237,7 @@ citation audit ──► trace important claims back to the original source
 - Safe handling of existing folders and manual PDF changes.
 - Metadata-only papers, DOI-based import/enrichment, and later PDF attachment.
 - Automatic `papers.json` and project BibTeX generation.
+- Raw BibTeX/citation provenance preserved separately without destabilizing project citation keys.
 - Claim provenance and lightweight citation/source audit.
 - Compact machine-readable output designed for coding agents.
 - No third-party Python dependencies.
@@ -243,6 +272,7 @@ my-project/
     │   ├── paper-a.pdf
     │   └── paper-b.pdf
     ├── references.bib
+    ├── citations.json
     └── claims.json
 ```
 
@@ -276,6 +306,9 @@ python scripts/zotero_papers.py <command> [options]
 | `import-doi DOI` | `--json` | Add/reuse a paper from DOI metadata even without a PDF. |
 | `import-metadata FILE` | `--json` | Add/reuse a metadata-only paper from JSON. |
 | `attach-pdf ITEM_KEY PDF` | `--json` | Attach a PDF later to an existing Zotero paper. |
+| `citation-resolve ITEM_KEY` | `--source-url`, `--source-type`, `--provider`, `--json` | Capture raw BibTeX from DOI content negotiation or a direct BibTeX endpoint. |
+| `citation-record ITEM_KEY FILE` | `--source-type`, `--source-url`, `--provider`, `--json` | Record a BibTeX file downloaded from publisher/proceedings/DBLP/etc. |
+| `citation-audit` | `--include-entries`, `--json` | Audit which project evidence papers have traceable citation provenance. |
 | `evidence ITEM_KEY` | `--json` | Report whether original PDF/full text is available for a project paper. |
 | `record-claim` | `--type`, `--paper`, `--claim`, source locator options | Record an important project claim with explicit provenance. |
 | `audit` | `--json`, `--check-sources` | Audit claim provenance and citation traceability. |

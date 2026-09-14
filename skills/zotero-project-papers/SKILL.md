@@ -3,7 +3,7 @@ name: zotero-project-papers
 description: Use only when the user explicitly asks to find, search, survey, retrieve, or reference academic papers/literature; explicitly asks for top-conference/top-journal papers; explicitly asks to use Zotero or the project's reference papers; explicitly asks for an answer grounded in actual papers; or explicitly asks to audit whether citations/papers support claims. Do not activate merely because a technical question could benefit from citations, because the user asks whether something "has been studied", or for ordinary design/coding/review discussion without an explicit literature-retrieval or citation-audit request. When activated, search the current project and local Zotero first, use web only as needed, archive papers actually used as evidence, and preserve claim provenance when citation verification is requested.
 compatibility: Requires Python 3.10+. Zotero 10+ with local application communication enabled is required only when a Zotero-backed read/write operation is needed. Designed for coding agents that can run local Python scripts; web search is supplied by the host agent.
 metadata:
-  version: "0.5.2"
+  version: "0.6.0"
 ---
 
 # Zotero Project Papers
@@ -102,7 +102,7 @@ When CC Switch manages the skill, never self-install or edit the managed install
 Existing users must not be required to manually rebuild a project after a Skill update. Treat backward compatibility as part of the workflow:
 
 - load and migrate older `.zotero-project.json` schemas automatically in place;
-- preserve existing `referenceDir`, `manifestFile`, `bibFile`, `claimsFile`, project collection binding, fallback policy, and acknowledged drift state unless the user explicitly changes them;
+- preserve existing `referenceDir`, `manifestFile`, `bibFile`, `claimsFile`, `citationsFile`, project collection binding, fallback policy, and acknowledged drift state unless the user explicitly changes them;
 - do not rename, move, flatten, prune, or delete an existing reference directory merely because a newer default exists;
 - keep previously published CLI commands working; add new commands/options without silently changing old command semantics;
 - upgrades themselves must not trigger Zotero writes, bulk syncs, cache warmups, file moves, or destructive cleanup;
@@ -275,6 +275,62 @@ $ZPP attach-pdf ITEM_KEY /path/to/paper.pdf --json
 This should happen automatically after the user explicitly asked for literature retrieval; do not make the user separately say “add these papers to Zotero”. Do **not** import every search result. Persist only papers actually used as evidence or explicitly requested by the user.
 
 The built-in `fetch` command accepts HTTPS, follows redirects, uses a conservative academic-host allowlist by default, verifies the PDF header/EOF/size/hash, and reports that access rights are **not automatically verified**. Prefer official or open-access URLs. Never bypass paywalls or use untrusted mirrors.
+
+# Citation provenance — preserve official/raw BibTeX without destabilizing project citations
+
+The project `references.bib` remains Zotero-generated for backward compatibility and stable writing workflows. **Never silently replace it with downloaded publisher/DBLP/OpenReview BibTeX entries.** Raw citation records are stored separately in:
+
+```text
+papers/citations.json
+```
+
+Capture citation provenance **only after a paper becomes project evidence**, not for every search candidate. This avoids turning a broad search into many extra network requests.
+
+Preferred source order is:
+
+1. publisher or official proceedings BibTeX when directly available;
+2. trusted bibliographic databases such as DBLP for computer-science papers;
+3. DOI content negotiation / DOI registry BibTeX;
+4. review/preprint platforms such as OpenReview or arXiv when that is the best available record;
+5. Zotero-generated BibTeX remains the project fallback/output.
+
+If the Zotero item has a DOI, the cheapest generic capture is:
+
+```bash
+$ZPP citation-resolve ITEM_KEY --json
+```
+
+This requests BibTeX through DOI content negotiation and records the raw entry, source URL/type, retrieval time, entry key, and SHA-256 in `papers/citations.json`.
+
+If an official proceedings/publisher/DBLP endpoint directly returns BibTeX:
+
+```bash
+$ZPP citation-resolve ITEM_KEY \
+  --source-url https://.../bibtex \
+  --source-type proceedings \
+  --provider CVF \
+  --json
+```
+
+If the website requires a human/browser click to download BibTeX, do **not** build site-specific scraping into the helper. The host agent/user may obtain the `.bib` file through the normal browser UI, then record it:
+
+```bash
+$ZPP citation-record ITEM_KEY /path/to/downloaded.bib \
+  --source-type publisher \
+  --source-url https://publisher.example/paper \
+  --provider "Publisher name" \
+  --json
+```
+
+Browser/UI download is a last fallback, not a prerequisite for using the paper. Do not delay a literature answer solely because official raw BibTeX is unavailable; DOI/Zotero metadata can remain the fallback and provenance can be improved later.
+
+Before submission or when the user asks to verify bibliography quality:
+
+```bash
+$ZPP citation-audit --json
+```
+
+Use `--include-entries` only when per-paper details are needed. Citation audit answers **where the citation metadata came from**, not whether a scientific claim is supported; use claim `audit` plus original-paper verification for that separate question.
 
 # Claim provenance and citation audit — explicit, lightweight, and local-first
 

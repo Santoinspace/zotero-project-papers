@@ -72,7 +72,7 @@ class UtilsTests(unittest.TestCase):
                 self.assertTrue(os.path.samefile(src, dst))
 
 
-    def test_config_v1_migrates_to_v5(self):
+    def test_config_v1_migrates_to_v6(self):
         cfg = zpp.normalize_project_config({
             "schemaVersion": 1,
             "collectionPath": "Projects/Test",
@@ -82,8 +82,9 @@ class UtilsTests(unittest.TestCase):
             "bibFile": "papers/references.bib",
             "fallback": "copy",
         })
-        self.assertEqual(cfg["schemaVersion"], 5)
+        self.assertEqual(cfg["schemaVersion"], 6)
         self.assertEqual(cfg["claimsFile"], "papers/claims.json")
+        self.assertEqual(cfg["citationsFile"], "papers/citations.json")
         self.assertEqual(cfg["sync"]["driftPolicy"], "prompt")
 
     def test_detect_reference_dirs_with_subdirs(self):
@@ -793,6 +794,66 @@ class UtilsTests(unittest.TestCase):
         finally:
             zpp.get_item = original_get
             zpp.pdf_attachments = original_pdf
+
+
+class CitationProvenanceTests(unittest.TestCase):
+    def _project(self, root: Path):
+        cfg = zpp.normalize_project_config({
+            "schemaVersion": 5,
+            "collectionPath": "Projects/Test",
+            "collectionKey": "AAAA1111",
+            "referenceDir": "papers/reference",
+            "manifestFile": "papers/reference/papers.json",
+            "bibFile": "papers/references.bib",
+            "claimsFile": "papers/claims.json",
+            "fallback": "copy",
+        })
+        (root / "papers" / "reference").mkdir(parents=True)
+        zpp.json_dump({"papers": [{
+            "itemKey": "ITEM0001", "title": "A Paper", "DOI": "10.1234/example",
+            "pdfStatus": "missing", "projectPath": None,
+        }]}, root / cfg["manifestFile"])
+        return cfg
+
+    def test_validate_bibtex(self):
+        raw = '@article{smith2026demo, title={Demo}, year={2026}}'
+        result = zpp.validate_bibtex_text(raw)
+        self.assertTrue(result["validBibtex"])
+        self.assertEqual(result["entryKey"], "smith2026demo")
+
+    def test_record_citation_preserves_raw_bibtex_and_source(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = self._project(root)
+            raw = '@article{officialKey, title={A Paper}, doi={10.1234/example}}'
+            result = zpp.record_citation_provenance(
+                root, cfg, item_key="ITEM0001", raw_bibtex=raw,
+                source={"type": "doi-registry", "provider": "DOI", "url": "https://doi.org/10.1234/example", "retrievedAt": zpp.utc_now()},
+            )
+            self.assertTrue(result["recorded"])
+            ledger = zpp.load_citations(root, cfg)
+            row = ledger["citations"]["ITEM0001"]
+            self.assertEqual(row["sources"][0]["rawBibtex"], raw)
+            self.assertEqual(row["sources"][0]["source"]["type"], "doi-registry")
+            self.assertEqual(cfg["bibFile"], "papers/references.bib")
+
+    def test_higher_authority_source_becomes_preferred_without_rewriting_project_bib(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = self._project(root)
+            zpp.record_citation_provenance(root, cfg, item_key="ITEM0001", raw_bibtex='@article{doiKey,title={A}}', source={"type":"doi-registry","provider":"DOI","retrievedAt":zpp.utc_now()})
+            result = zpp.record_citation_provenance(root, cfg, item_key="ITEM0001", raw_bibtex='@inproceedings{cvfKey,title={A}}', source={"type":"proceedings","provider":"CVF","retrievedAt":zpp.utc_now()})
+            self.assertEqual(result["preferredSource"]["type"], "proceedings")
+            self.assertFalse((root / cfg["bibFile"]).exists())
+
+    def test_citation_audit_reports_missing_and_doi_resolvable(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cfg = self._project(root)
+            out = zpp.citation_audit_local(root, cfg)
+            self.assertEqual(out["paperCount"], 1)
+            self.assertEqual(out["missingCitationProvenance"], 1)
+            self.assertEqual(out["doiResolvableItemKeys"], ["ITEM0001"])
 
 
 if __name__ == "__main__":

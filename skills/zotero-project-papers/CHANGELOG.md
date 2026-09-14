@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.6.0
+
+### Citation provenance
+
+- Added `papers/citations.json` as a separate raw citation/BibTeX provenance ledger.
+- Added `citation-resolve ITEM_KEY` for DOI content negotiation or a direct HTTPS BibTeX endpoint.
+- Added `citation-record ITEM_KEY FILE` for BibTeX obtained through publisher/proceedings/DBLP/browser workflows.
+- Added `citation-audit` to report provenance coverage without pretending raw BibTeX is automatically correct.
+- Citation sources are ranked conservatively: publisher/proceedings > bibliographic database > DOI registry > review/preprint/user-provided.
+- Existing `papers/references.bib` remains Zotero-generated; raw source entries never silently replace project citation keys.
+- Citation provenance is captured only after a paper becomes project evidence, not for every search candidate.
+
+### Compatibility
+
+- Project schema upgrades automatically from v5 to v6 and preserves all existing reference/BibTeX/claim paths and collection bindings.
+- Existing commands keep their previous semantics and do not gain hidden network requests.
+- Updates do not move or delete existing user files.
+
+### Validation
+
+- Added regression tests for raw BibTeX preservation, source ranking, missing provenance audit, and v5→v6 automatic migration.
+
 ## 0.5.2
 
 - Fixed false-zero whole-library searches by querying Zotero top-level bibliographic items (`/items/top`) instead of limiting `/items` and filtering child attachments afterward.
