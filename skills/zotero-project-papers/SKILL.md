@@ -1,9 +1,9 @@
 ---
 name: zotero-project-papers
-description: Use only when the user explicitly asks to find, search, survey, retrieve, or reference academic papers/literature; explicitly asks for top-conference/top-journal papers; explicitly asks to use Zotero or the project's reference papers; or explicitly asks for an answer grounded in actual papers. Do not activate merely because a technical question could benefit from citations, because the user asks whether something "has been studied", or for ordinary design/coding discussion without an explicit literature-retrieval request. When activated, search the current project and local Zotero first, use web only as needed, and archive papers actually used as evidence into Zotero and the project reference set.
+description: Use only when the user explicitly asks to find, search, survey, retrieve, or reference academic papers/literature; explicitly asks for top-conference/top-journal papers; explicitly asks to use Zotero or the project's reference papers; explicitly asks for an answer grounded in actual papers; or explicitly asks to audit whether citations/papers support claims. Do not activate merely because a technical question could benefit from citations, because the user asks whether something "has been studied", or for ordinary design/coding/review discussion without an explicit literature-retrieval or citation-audit request. When activated, search the current project and local Zotero first, use web only as needed, archive papers actually used as evidence, and preserve claim provenance when citation verification is requested.
 compatibility: Requires Zotero 10+ running locally with local application communication enabled and Python 3.10+. Designed for coding agents that can run local Python scripts; web search is supplied by the host agent.
 metadata:
-  version: "0.4.0"
+  version: "0.5.1"
 ---
 
 # Zotero Project Papers
@@ -23,7 +23,8 @@ Activate only when the user explicitly requests at least one of the following:
 - reference papers from a named year, venue tier, conference, or journal;
 - use the user's Zotero library or the current project's reference papers;
 - answer/design/compare **based on actual papers**, **based on top-conference papers**, or equivalent explicit evidence-grounding language;
-- read or cite a specifically identified paper.
+- read or cite a specifically identified paper;
+- explicitly audit whether citations/papers support claims, including citation verification during simulated peer review.
 
 Typical positive triggers:
 
@@ -32,6 +33,7 @@ Typical positive triggers:
 - “根据本项目 reference 里的论文写 related work。”
 - “Find recent NeurIPS/ICLR papers on this topic.”
 - “Use actual papers as evidence for the design.”
+- “核验这些引用是否真的支持对应结论，并区分原文、摘要和推断。”
 
 Do **not** activate for requests such as:
 
@@ -40,6 +42,7 @@ Do **not** activate for requests such as:
 - “这种拒绝预测机制会有什么影响？”
 - “这个方案有什么问题？”
 - “这个方向有人研究吗？” when the user did not explicitly ask to search/retrieve literature.
+- “帮我模拟审稿人看看写得是否清楚。” when the user did not explicitly ask to verify citations/evidence.
 
 For mixed conversations, activate **only at the turn where the user explicitly switches to literature retrieval**. Earlier technical discussion does not retroactively justify running this skill.
 
@@ -83,6 +86,19 @@ python <this-skill-directory>/scripts/zotero_papers.py
 
 When CC Switch manages the skill, never self-install or edit the managed installed copy.
 
+## Upgrade compatibility contract
+
+Existing users must not be required to manually rebuild a project after a Skill update. Treat backward compatibility as part of the workflow:
+
+- load and migrate older `.zotero-project.json` schemas automatically in place;
+- preserve existing `referenceDir`, `manifestFile`, `bibFile`, `claimsFile`, project collection binding, fallback policy, and acknowledged drift state unless the user explicitly changes them;
+- do not rename, move, flatten, prune, or delete an existing reference directory merely because a newer default exists;
+- keep previously published CLI commands working; add new commands/options without silently changing old command semantics;
+- upgrades themselves must not trigger Zotero writes, bulk syncs, cache warmups, file moves, or destructive cleanup;
+- if a future migration cannot be performed safely and automatically, stop with a compact explanation instead of asking the user to manually delete/recreate large project state.
+
+Schema-version changes are only for persisted config-shape changes. A normal code/docs release should keep the existing schema version.
+
 # Diagnostics and fast preflight
 
 Only after the activation policy is satisfied, perform one consistency preflight. Do not run `doctor` on every literature request; use it on first setup or after a Zotero/API/auth failure.
@@ -105,7 +121,7 @@ Then perform the project consistency preflight:
 $ZPP check --json
 ```
 
-In v0.4 this is normally a **quick marker check**. If the project files and cached Zotero library version are unchanged since the last full check, it returns without contacting Zotero.
+In v0.5 this is normally a **quick marker check**. If the project files and cached Zotero library version are unchanged since the last full check, it returns without contacting Zotero.
 
 Interpret:
 
@@ -246,6 +262,107 @@ $ZPP attach-pdf ITEM_KEY /path/to/paper.pdf --json
 This should happen automatically after the user explicitly asked for literature retrieval; do not make the user separately say “add these papers to Zotero”. Do **not** import every search result. Persist only papers actually used as evidence or explicitly requested by the user.
 
 The built-in `fetch` command accepts HTTPS, follows redirects, uses a conservative academic-host allowlist by default, verifies the PDF header/EOF/size/hash, and reports that access rights are **not automatically verified**. Prefer official or open-access URLs. Never bypass paywalls or use untrusted mirrors.
+
+# Claim provenance and citation audit — explicit, lightweight, and local-first
+
+Do not automatically record every sentence the agent writes. Record only claims that materially support a research motivation, comparison, design choice, related-work statement, or conclusion, especially when the user asks for citation verification or simulated peer review.
+
+The project claim ledger is:
+
+```text
+papers/claims.json
+```
+
+It distinguishes four claim types:
+
+- `primary`: the original paper directly supports the claim;
+- `summary`: an AI-generated summary/paraphrase of one or more papers;
+- `inference`: an Agent synthesis derived across paper evidence;
+- `hypothesis`: a project/research hypothesis proposed by the Agent/user, not a claim already established by the cited paper.
+
+And four source layers:
+
+- `original-paper`: Zotero PDF or Zotero-indexed original full text;
+- `ai-summary`: a generated summary/note derived from a paper;
+- `agent-inference`: a synthesis or hypothesis produced by the Agent;
+- `metadata`: title/abstract/bibliographic metadata only.
+
+Before presenting a statement as directly supported by a paper, check source availability:
+
+```bash
+$ZPP evidence ITEM_KEY --json
+```
+
+This reports whether the item is metadata-only, has a local PDF, or has Zotero-indexed full text. It does **not** claim semantic support merely because the PDF exists.
+
+For an important directly-supported claim, record a reproducible locator whenever possible:
+
+```bash
+$ZPP record-claim \
+  --type primary \
+  --paper ITEM_KEY \
+  --claim "The method improves boundary quality under the reported benchmark." \
+  --page 7 \
+  --table "Table 2" \
+  --json
+```
+
+For a generated summary:
+
+```bash
+$ZPP record-claim \
+  --type summary \
+  --paper ITEM_KEY \
+  --claim "The paper's main contribution is a multi-scale interaction mechanism." \
+  --source-ref "notes/paper-summary.md" \
+  --json
+```
+
+For a cross-paper inference:
+
+```bash
+$ZPP record-claim \
+  --type inference \
+  --paper ITEM_KEY_A \
+  --paper ITEM_KEY_B \
+  --claim "These results suggest geometry-aware prompting may be more useful than regenerating detailed text." \
+  --json
+```
+
+For a new project hypothesis, do not disguise it as literature evidence:
+
+```bash
+$ZPP record-claim \
+  --type hypothesis \
+  --claim "A dual semantic-geometric memory may reduce the information bottleneck." \
+  --json
+```
+
+A cheap provenance audit is purely local and should be preferred first:
+
+```bash
+$ZPP audit --json
+```
+
+If the user asks to audit an existing manuscript/related-work section and the claim ledger is empty, **do not interpret an empty audit as success**. Treat it as "no provenance has been recorded yet": identify the specific claims/citations the user wants checked, resolve the cited project/Zotero papers, inspect the original source, and record only the important claims that should remain traceable.
+
+It summarizes direct-paper claims, AI-summary-derived claims, Agent inferences, hypotheses, missing source locators, missing PDFs, and broken project-paper references without contacting Zotero.
+
+Only when the user explicitly wants source availability checked should the Agent use:
+
+```bash
+$ZPP audit --check-sources --json
+```
+
+This contacts Zotero to confirm referenced items/PDF/full-text availability. Even then, `audit` is a **traceability audit**, not semantic proof. To decide whether a citation truly supports a claim, the Agent must read the cited original section/table/figure and compare it against the claim. Never convert `ai-summary` or `agent-inference` into a `primary` claim merely because a real citation is attached.
+
+When simulating peer review or checking related work, report distinctions explicitly, for example:
+
+- directly traceable to original paper;
+- AI-summary-derived and needs original-source check;
+- Agent inference across papers;
+- project hypothesis;
+- citation/source missing or not reproducible.
 
 # First use and project binding
 

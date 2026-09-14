@@ -72,7 +72,7 @@ class UtilsTests(unittest.TestCase):
                 self.assertTrue(os.path.samefile(src, dst))
 
 
-    def test_config_v1_migrates_to_v4(self):
+    def test_config_v1_migrates_to_v5(self):
         cfg = zpp.normalize_project_config({
             "schemaVersion": 1,
             "collectionPath": "Projects/Test",
@@ -82,7 +82,8 @@ class UtilsTests(unittest.TestCase):
             "bibFile": "papers/references.bib",
             "fallback": "copy",
         })
-        self.assertEqual(cfg["schemaVersion"], 4)
+        self.assertEqual(cfg["schemaVersion"], 5)
+        self.assertEqual(cfg["claimsFile"], "papers/claims.json")
         self.assertEqual(cfg["sync"]["driftPolicy"], "prompt")
 
     def test_detect_reference_dirs_with_subdirs(self):
@@ -613,6 +614,119 @@ class UtilsTests(unittest.TestCase):
     def test_source_trust_known_academic_host(self):
         self.assertTrue(zpp.source_trust("https://openaccess.thecvf.com/paper.pdf")["knownAcademicHost"])
         self.assertFalse(zpp.source_trust("https://example.invalid/paper.pdf")["knownAcademicHost"])
+
+
+    def test_record_primary_claim_writes_local_ledger(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "refs").mkdir()
+            config = {
+                "schemaVersion": 5,
+                "collectionKey": "COLL1",
+                "referenceDir": "refs",
+                "manifestFile": "refs/papers.json",
+                "claimsFile": "papers/claims.json",
+            }
+            zpp.json_dump({"papers": [{"itemKey": "ITEM1", "title": "Paper", "pdfStatus": "available"}]}, root / "refs" / "papers.json")
+            out = zpp.record_claim_local(
+                root, config, claim="Method A improves boundary quality.", claim_type="primary",
+                papers=["ITEM1"], locator={"page": "7", "table": "2"},
+            )
+            self.assertTrue(out["recorded"])
+            ledger = zpp.load_claims(root, config)
+            self.assertEqual(ledger["claims"][0]["sourceLayer"], "original-paper")
+            self.assertEqual(ledger["claims"][0]["locator"]["page"], "7")
+
+    def test_record_claim_rejects_untracked_paper(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "refs").mkdir()
+            config = {"collectionKey": "COLL1", "referenceDir": "refs", "manifestFile": "refs/papers.json", "claimsFile": "papers/claims.json"}
+            zpp.json_dump({"papers": []}, root / "refs" / "papers.json")
+            with self.assertRaises(zpp.ZPPError) as ctx:
+                zpp.record_claim_local(root, config, claim="A claim", claim_type="summary", papers=["NOPE"])
+            self.assertEqual(ctx.exception.code, "claim_untracked_paper")
+
+    def test_record_claim_deduplicates_same_claim(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "refs").mkdir()
+            config = {"collectionKey": "COLL1", "referenceDir": "refs", "manifestFile": "refs/papers.json", "claimsFile": "papers/claims.json"}
+            zpp.json_dump({"papers": [{"itemKey": "ITEM1", "pdfStatus": "available"}]}, root / "refs" / "papers.json")
+            first = zpp.record_claim_local(root, config, claim="A useful result.", claim_type="summary", papers=["ITEM1"])
+            second = zpp.record_claim_local(root, config, claim="A useful result.", claim_type="summary", papers=["ITEM1"])
+            self.assertTrue(first["recorded"])
+            self.assertTrue(second["duplicate"])
+            self.assertEqual(len(zpp.load_claims(root, config)["claims"]), 1)
+
+    def test_audit_distinguishes_source_layers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "refs").mkdir()
+            config = {"collectionKey": "COLL1", "referenceDir": "refs", "manifestFile": "refs/papers.json", "claimsFile": "papers/claims.json"}
+            zpp.json_dump({"papers": [
+                {"itemKey": "P1", "pdfStatus": "available"},
+                {"itemKey": "P2", "pdfStatus": "missing"},
+            ]}, root / "refs" / "papers.json")
+            ledger = zpp.load_claims(root, config)
+            ledger["claims"] = [
+                {"id": "c1", "claim": "direct", "type": "primary", "sourceLayer": "original-paper", "papers": ["P1"], "locator": {"page": "2"}},
+                {"id": "c2", "claim": "summary", "type": "summary", "sourceLayer": "ai-summary", "papers": ["P1"], "locator": {}},
+                {"id": "c3", "claim": "inference", "type": "inference", "sourceLayer": "agent-inference", "papers": ["P1", "P2"], "locator": {}},
+                {"id": "c4", "claim": "hypothesis", "type": "hypothesis", "sourceLayer": "agent-inference", "papers": [], "locator": {}},
+            ]
+            zpp.save_claims(root, config, ledger)
+            out = zpp.audit_claims_local(root, config, include_claims=True)
+            self.assertEqual(out["originalPaperClaims"], 1)
+            self.assertEqual(out["aiSummaryClaims"], 1)
+            self.assertEqual(out["inferenceClaims"], 1)
+            self.assertEqual(out["hypothesisClaims"], 1)
+            self.assertEqual(out["verdict"], "clean")
+            self.assertFalse(out["semanticVerificationPerformed"])
+
+    def test_audit_flags_original_claim_without_pdf(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "refs").mkdir()
+            config = {"collectionKey": "COLL1", "referenceDir": "refs", "manifestFile": "refs/papers.json", "claimsFile": "papers/claims.json"}
+            zpp.json_dump({"papers": [{"itemKey": "P1", "pdfStatus": "missing"}]}, root / "refs" / "papers.json")
+            ledger = zpp.load_claims(root, config)
+            ledger["claims"] = [{"id": "c1", "claim": "direct", "type": "primary", "sourceLayer": "original-paper", "papers": ["P1"], "locator": {"section": "Results"}}]
+            zpp.save_claims(root, config, ledger)
+            out = zpp.audit_claims_local(root, config)
+            self.assertEqual(out["missingOriginalPdfClaimIds"], ["c1"])
+
+    def test_record_claim_rejects_source_ref_outside_project(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as outside:
+            root = Path(td)
+            (root / "refs").mkdir()
+            config = {"collectionKey": "COLL1", "referenceDir": "refs", "manifestFile": "refs/papers.json", "claimsFile": "papers/claims.json"}
+            zpp.json_dump({"papers": [{"itemKey": "ITEM1", "pdfStatus": "available"}]}, root / "refs" / "papers.json")
+            with self.assertRaises(zpp.ZPPError) as ctx:
+                zpp.record_claim_local(root, config, claim="Summary", claim_type="summary", papers=["ITEM1"], source_ref=str(Path(outside) / "summary.md"))
+            self.assertEqual(ctx.exception.code, "claim_source_ref_outside_project")
+
+
+    def test_paper_evidence_status_distinguishes_indexed_fulltext(self):
+        class FakeClient:
+            def read(self, path, params=None):
+                if path.endswith("/fulltext"):
+                    return {"content": "paper text", "indexedPages": 5, "totalPages": 5}
+                raise AssertionError(path)
+        original_get = zpp.get_item
+        original_pdf = zpp.pdf_attachments
+        try:
+            zpp.get_item = lambda client, key: {"data": {"key": key, "itemType": "journalArticle", "title": "Paper", "creators": []}}
+            with tempfile.TemporaryDirectory() as td:
+                pdf = Path(td) / "paper.pdf"
+                pdf.write_bytes(b"pdf")
+                zpp.pdf_attachments = lambda client, key: [{"key": "ATT1", "filename": "paper.pdf", "path": str(pdf), "linkMode": "imported_file"}]
+                out = zpp.paper_evidence_status(FakeClient(), "ITEM1")
+                self.assertEqual(out["sourceAvailability"], "indexed-fulltext")
+                self.assertEqual(out["recommendedSourceLayer"], "original-paper")
+        finally:
+            zpp.get_item = original_get
+            zpp.pdf_attachments = original_pdf
 
 
 if __name__ == "__main__":

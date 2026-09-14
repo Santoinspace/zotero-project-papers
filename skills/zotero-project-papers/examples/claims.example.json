@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "managedBy": "zotero-project-papers",
+  "collectionPath": "Projects/ExampleProject",
+  "collectionKey": "EXAMPLE1",
+  "claims": [
+    {
+      "id": "claim-example-primary",
+      "claim": "The reported experiment shows an improvement on the stated benchmark.",
+      "type": "primary",
+      "sourceLayer": "original-paper",
+      "papers": ["ITEMKEY1"],
+      "locator": {
+        "page": "7",
+        "table": "Table 2"
+      }
+    },
+    {
+      "id": "claim-example-inference",
+      "claim": "Taken together, these papers suggest a geometry-aware direction worth testing.",
+      "type": "inference",
+      "sourceLayer": "agent-inference",
+      "papers": ["ITEMKEY1", "ITEMKEY2"],
+      "locator": {}
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""zotero-project-papers v0.4.0
+"""zotero-project-papers v0.5.1
 
 Stdlib-only helper for an Agent Skill that binds a local project to a Zotero 10
 collection and materializes Zotero-managed PDFs into the project reference dir.
@@ -34,11 +34,12 @@ from typing import Any, Iterable
 APP_NAME = "Zotero Project Papers"
 BASE_URL = os.environ.get("ZOTERO_LOCAL_API", "http://127.0.0.1:23119/api/").rstrip("/") + "/"
 CONFIG_NAME = ".zotero-project.json"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_COLLECTION_ROOT = "Projects"
 DEFAULT_REFERENCE_DIR = "papers/reference"
 DEFAULT_BIB_FILE = "papers/references.bib"
 MANIFEST_NAME = "papers.json"
+CLAIMS_FILE = "papers/claims.json"
 REFERENCE_CANDIDATES = ("reference", "references", "refs", "literature", "literatures", "papers/reference", "papers/references")
 AUTH_TIMEOUT = int(os.environ.get("ZPP_AUTH_TIMEOUT", "300"))
 CACHE_TTL_SECONDS = int(os.environ.get("ZPP_CACHE_TTL", "60"))
@@ -278,7 +279,7 @@ def default_sync_config() -> dict[str, Any]:
         "driftPolicy": "prompt",
         "acknowledgedFingerprint": None,
         "acknowledgedAt": None,
-        # v0.4 quick preflight markers. These avoid a Zotero round-trip when neither
+        # v0.5 quick preflight markers. These avoid a Zotero round-trip when neither
         # the project reference view nor the cached Zotero library version changed.
         "quickFingerprint": None,
         "lastFullClean": None,
@@ -295,6 +296,7 @@ def normalize_project_config(config: dict[str, Any]) -> dict[str, Any]:
     out.setdefault("referenceDir", DEFAULT_REFERENCE_DIR)
     out.setdefault("manifestFile", (Path(out["referenceDir"]) / MANIFEST_NAME).as_posix())
     out.setdefault("bibFile", DEFAULT_BIB_FILE)
+    out.setdefault("claimsFile", CLAIMS_FILE)
     out.setdefault("fallback", "copy")
     out.setdefault("zoteroServerID", None)
     sync = default_sync_config()
@@ -1479,6 +1481,302 @@ def load_old_manifest(root: Path, config: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
+
+def claims_path(root: Path, config: dict[str, Any]) -> Path:
+    return root / str(config.get("claimsFile") or CLAIMS_FILE)
+
+
+def load_claims(root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    path = claims_path(root, config)
+    if not path.exists():
+        return {
+            "schemaVersion": 1,
+            "managedBy": "zotero-project-papers",
+            "collectionPath": config.get("collectionPath"),
+            "collectionKey": config.get("collectionKey"),
+            "claims": [],
+        }
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ZPPError(
+            f"Cannot read claim ledger {path}: {exc}",
+            code="claims_invalid",
+            hint="Fix or remove the invalid claims.json before recording or auditing claims.",
+        ) from exc
+    if not isinstance(data, dict):
+        raise ZPPError(f"{path} must contain a JSON object", code="claims_invalid")
+    claims = data.get("claims")
+    if claims is None:
+        data["claims"] = []
+    elif not isinstance(claims, list):
+        raise ZPPError(f"{path}: claims must be an array", code="claims_invalid")
+    data.setdefault("schemaVersion", 1)
+    data.setdefault("managedBy", "zotero-project-papers")
+    data.pop("projectRoot", None)
+    data.setdefault("collectionPath", config.get("collectionPath"))
+    data.setdefault("collectionKey", config.get("collectionKey"))
+    return data
+
+
+def save_claims(root: Path, config: dict[str, Any], ledger: dict[str, Any]) -> Path:
+    ledger = dict(ledger)
+    ledger["schemaVersion"] = 1
+    ledger["managedBy"] = "zotero-project-papers"
+    ledger.pop("projectRoot", None)
+    ledger["collectionPath"] = config.get("collectionPath")
+    ledger["collectionKey"] = config.get("collectionKey")
+    ledger["updatedAt"] = utc_now()
+    path = claims_path(root, config)
+    json_dump(ledger, path)
+    return path
+
+
+def project_paper_index(root: Path, config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    manifest = load_old_manifest(root, config)
+    return {
+        str(row.get("itemKey")): row
+        for row in (manifest.get("papers") or [])
+        if isinstance(row, dict) and row.get("itemKey")
+    }
+
+
+def claim_default_source_layer(claim_type: str) -> str:
+    return {
+        "primary": "original-paper",
+        "summary": "ai-summary",
+        "inference": "agent-inference",
+        "hypothesis": "agent-inference",
+    }[claim_type]
+
+
+def claim_locator_from_args(args: argparse.Namespace) -> dict[str, str]:
+    locator: dict[str, str] = {}
+    for attr, key in (("page", "page"), ("section", "section"), ("table", "table"), ("figure", "figure")):
+        value = getattr(args, attr, None)
+        if value not in (None, ""):
+            locator[key] = str(value)
+    return locator
+
+
+def validate_claim_record(claim_type: str, source_layer: str, papers: list[str], locator: dict[str, str]) -> list[str]:
+    warnings: list[str] = []
+    if claim_type in {"primary", "summary"} and not papers:
+        raise ZPPError(
+            f"{claim_type} claims require at least one --paper ITEM_KEY.",
+            code="claim_missing_paper",
+        )
+    if claim_type == "inference" and not papers:
+        raise ZPPError(
+            "Inference claims require at least one source paper. Use hypothesis for a proposal not directly based on a paper.",
+            code="claim_missing_paper",
+        )
+    if claim_type == "primary" and source_layer != "original-paper":
+        raise ZPPError(
+            "A primary claim must use source layer original-paper.",
+            code="claim_source_mismatch",
+            hint="Use --type summary for an AI-generated summary or --type inference for an Agent synthesis.",
+        )
+    if claim_type == "primary" and not locator:
+        warnings.append("Primary claim has no page/section/table/figure locator; add one when possible so a reviewer can reproduce the citation check.")
+    if source_layer == "metadata" and claim_type == "primary":
+        warnings.append("Metadata cannot establish a primary paper claim; verify against the original paper before citing it as evidence.")
+    return warnings
+
+
+def _claim_dedupe_key(claim: str, claim_type: str, papers: list[str]) -> tuple[str, str, tuple[str, ...]]:
+    return (normalize_title(claim), claim_type, tuple(sorted(set(papers))))
+
+
+def record_claim_local(
+    root: Path,
+    config: dict[str, Any],
+    *,
+    claim: str,
+    claim_type: str,
+    papers: list[str],
+    source_layer: str | None = None,
+    locator: dict[str, str] | None = None,
+    source_ref: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    claim = claim.strip()
+    if not claim:
+        raise ZPPError("Claim text cannot be empty.", code="claim_empty")
+    papers = [str(x).strip() for x in papers if str(x).strip()]
+    papers = list(dict.fromkeys(papers))
+    source_layer = source_layer or claim_default_source_layer(claim_type)
+    locator = dict(locator or {})
+    warnings = validate_claim_record(claim_type, source_layer, papers, locator)
+
+    paper_index = project_paper_index(root, config)
+    missing = [key for key in papers if key not in paper_index]
+    if missing:
+        raise ZPPError(
+            "Claim references paper(s) that are not in the current project manifest.",
+            code="claim_untracked_paper",
+            hint="Add/sync the paper into the current project first, then record the claim.",
+            details={"itemKeys": missing},
+        )
+
+    ledger = load_claims(root, config)
+    target_key = _claim_dedupe_key(claim, claim_type, papers)
+    for existing in ledger.get("claims", []):
+        if not isinstance(existing, dict):
+            continue
+        if _claim_dedupe_key(str(existing.get("claim") or ""), str(existing.get("type") or ""), [str(x) for x in (existing.get("papers") or [])]) == target_key:
+            return {
+                "recorded": False,
+                "duplicate": True,
+                "claim": existing,
+                "claimsFile": relpath_for_manifest(claims_path(root, config), root),
+            }
+
+    row: dict[str, Any] = {
+        "id": f"claim-{uuid.uuid4().hex[:12]}",
+        "claim": claim,
+        "type": claim_type,
+        "sourceLayer": source_layer,
+        "papers": papers,
+        "locator": locator,
+        "createdAt": utc_now(),
+    }
+    if source_ref:
+        ref_path = Path(source_ref).expanduser()
+        if ref_path.is_absolute():
+            try:
+                source_ref = ref_path.resolve().relative_to(root.resolve()).as_posix()
+            except ValueError as exc:
+                raise ZPPError(
+                    "--source-ref must be project-relative (or an absolute path inside the project).",
+                    code="claim_source_ref_outside_project",
+                    hint="Use a project-local note/summary reference so claims.json does not persist private absolute paths.",
+                ) from exc
+        row["sourceRef"] = Path(source_ref).as_posix()
+    if note:
+        row["note"] = note
+    if warnings:
+        row["warnings"] = warnings
+    ledger.setdefault("claims", []).append(row)
+    path = save_claims(root, config, ledger)
+    return {
+        "recorded": True,
+        "duplicate": False,
+        "claim": row,
+        "claimsFile": relpath_for_manifest(path, root),
+    }
+
+
+def claims_for_paper(root: Path, config: dict[str, Any], item_key: str) -> list[dict[str, Any]]:
+    ledger = load_claims(root, config)
+    out: list[dict[str, Any]] = []
+    for row in ledger.get("claims", []) or []:
+        if isinstance(row, dict) and item_key in [str(x) for x in (row.get("papers") or [])]:
+            out.append({
+                "id": row.get("id"),
+                "claim": row.get("claim"),
+                "type": row.get("type"),
+                "sourceLayer": row.get("sourceLayer"),
+                "locator": row.get("locator") or {},
+            })
+    return out
+
+
+def audit_claims_local(root: Path, config: dict[str, Any], *, include_claims: bool = False) -> dict[str, Any]:
+    ledger = load_claims(root, config)
+    paper_index = project_paper_index(root, config)
+    rows = [x for x in (ledger.get("claims") or []) if isinstance(x, dict)]
+    by_type: dict[str, int] = {}
+    by_layer: dict[str, int] = {}
+    broken: list[dict[str, Any]] = []
+    needs_locator: list[str] = []
+    original_claims = 0
+    summary_claims = 0
+    inference_claims = 0
+    hypothesis_claims = 0
+    metadata_only_claims = 0
+    pdf_missing_claims: list[str] = []
+
+    assessed: list[dict[str, Any]] = []
+    for row in rows:
+        cid = str(row.get("id") or "")
+        ctype = str(row.get("type") or "unknown")
+        layer = str(row.get("sourceLayer") or "unknown")
+        papers = [str(x) for x in (row.get("papers") or [])]
+        locator = row.get("locator") if isinstance(row.get("locator"), dict) else {}
+        by_type[ctype] = by_type.get(ctype, 0) + 1
+        by_layer[layer] = by_layer.get(layer, 0) + 1
+
+        missing_papers = [key for key in papers if key not in paper_index]
+        if missing_papers:
+            broken.append({"claimId": cid, "missingItemKeys": missing_papers})
+        if ctype == "primary":
+            original_claims += 1
+            if not locator:
+                needs_locator.append(cid)
+        elif ctype == "summary":
+            summary_claims += 1
+        elif ctype == "inference":
+            inference_claims += 1
+        elif ctype == "hypothesis":
+            hypothesis_claims += 1
+        if layer == "metadata":
+            metadata_only_claims += 1
+        if layer == "original-paper":
+            if any(paper_index.get(key, {}).get("pdfStatus") != "available" for key in papers if key in paper_index):
+                pdf_missing_claims.append(cid)
+
+        if missing_papers:
+            traceability = "broken-paper-reference"
+        elif ctype == "hypothesis":
+            traceability = "hypothesis-not-paper-claim"
+        elif layer == "agent-inference":
+            traceability = "agent-inference"
+        elif layer == "ai-summary":
+            traceability = "ai-summary-derived"
+        elif layer == "metadata":
+            traceability = "metadata-only"
+        elif layer == "original-paper" and not locator:
+            traceability = "original-source-needs-locator"
+        else:
+            traceability = "source-traceable"
+        assessed.append({
+            "id": cid,
+            "type": ctype,
+            "sourceLayer": layer,
+            "traceability": traceability,
+            "papers": papers,
+            "locator": locator,
+            "claim": row.get("claim") if include_claims else None,
+        })
+
+    verdict = "clean"
+    if broken:
+        verdict = "broken"
+    elif needs_locator or pdf_missing_claims or metadata_only_claims:
+        verdict = "needs-review"
+
+    out: dict[str, Any] = {
+        "claimsFile": relpath_for_manifest(claims_path(root, config), root),
+        "claimCount": len(rows),
+        "byType": by_type,
+        "bySourceLayer": by_layer,
+        "originalPaperClaims": original_claims,
+        "aiSummaryClaims": summary_claims,
+        "inferenceClaims": inference_claims,
+        "hypothesisClaims": hypothesis_claims,
+        "metadataOnlyClaims": metadata_only_claims,
+        "needsLocatorClaimIds": needs_locator,
+        "missingOriginalPdfClaimIds": sorted(set(pdf_missing_claims)),
+        "brokenPaperReferences": broken,
+        "verdict": verdict,
+        "semanticVerificationPerformed": False,
+        "note": "This is a provenance/traceability audit. It does not prove that a cited paper semantically supports the claim.",
+    }
+    if include_claims:
+        out["claims"] = assessed
+    return out
+
 def manifest_prior_paths(old_manifest: dict[str, Any]) -> dict[str, str]:
     out = {}
     for p in old_manifest.get("papers", []) or []:
@@ -1892,7 +2190,7 @@ def crossref_metadata(doi_value: str) -> dict[str, Any]:
         raise ZPPError(f"Invalid DOI: {doi_value}", code="invalid_doi")
     url = f"{CROSSREF_BASE_URL}/works/{urllib.parse.quote(doi, safe='')}"
     mailto = os.environ.get("ZPP_CROSSREF_MAILTO", "").strip()
-    agent = "ZoteroProjectPapers/0.4.0"
+    agent = "ZoteroProjectPapers/0.5.1"
     if mailto:
         agent += f" (mailto:{mailto})"
     req = urllib.request.Request(url, headers={"User-Agent": agent, "Accept": "application/json"})
@@ -2009,7 +2307,7 @@ def download_pdf(url: str, output: Path, *, allow_untrusted: bool = False, max_b
             hint="Prefer an official/open-access paper URL, or explicitly use --allow-untrusted after verifying the source.",
             details=trust,
         )
-    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.4.0", "Accept": "application/pdf,*/*;q=0.5"})
+    req = urllib.request.Request(url, headers={"User-Agent": "ZoteroProjectPapers/0.5.1", "Accept": "application/pdf,*/*;q=0.5"})
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp = output.with_suffix(output.suffix + ".part")
     try:
@@ -2311,7 +2609,7 @@ def cmd_check(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args))
     assert config is not None
 
-    # v0.4 fast path: when local files/manifest and the cached Zotero library version
+    # v0.5 fast path: when local files/manifest and the cached Zotero library version
     # are unchanged, reuse the last full consistency result without touching Zotero.
     quick = quick_project_marker(root, config)
     sync_cfg = config.get("sync") if isinstance(config.get("sync"), dict) else default_sync_config()
@@ -2765,6 +3063,149 @@ def cmd_fulltext(args: argparse.Namespace) -> dict[str, Any] | str:
     return content
 
 
+
+def paper_evidence_status(client: ZoteroClient, item_key: str) -> dict[str, Any]:
+    obj = get_item(client, item_key)
+    summary = item_summary(obj, brief=True)
+    attachments = pdf_attachments(client, item_key)
+    pdf_rows: list[dict[str, Any]] = []
+    indexed_any = False
+    for att in attachments:
+        key = str(att.get("key") or "")
+        path = str(att.get("path") or "")
+        exists = bool(path and Path(path).exists())
+        fulltext_info: dict[str, Any] | None = None
+        if key:
+            try:
+                full = client.read(f"users/0/items/{key}/fulltext")
+                if isinstance(full, dict):
+                    indexed = bool(str(full.get("content") or "")) or bool(full.get("indexedPages"))
+                    indexed_any = indexed_any or indexed
+                    fulltext_info = {
+                        "indexed": indexed,
+                        "indexedPages": full.get("indexedPages"),
+                        "totalPages": full.get("totalPages"),
+                    }
+            except ZPPError:
+                fulltext_info = {"indexed": False}
+        pdf_rows.append({
+            "attachmentKey": key or None,
+            "filename": att.get("filename"),
+            "pathAvailable": exists,
+            "linkMode": att.get("linkMode"),
+            "fulltext": fulltext_info or {"indexed": False},
+        })
+    pdf_present = any(bool(x.get("pathAvailable")) for x in pdf_rows)
+    if indexed_any:
+        availability = "indexed-fulltext"
+        recommended_layer = "original-paper"
+    elif pdf_present:
+        availability = "pdf-present-unindexed"
+        recommended_layer = "original-paper"
+    else:
+        availability = "metadata-only"
+        recommended_layer = "metadata"
+    return {
+        "itemKey": item_key,
+        "item": summary,
+        "sourceAvailability": availability,
+        "recommendedSourceLayer": recommended_layer,
+        "pdfPresent": pdf_present,
+        "indexedFulltext": indexed_any,
+        "attachments": pdf_rows,
+    }
+
+
+def cmd_evidence(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args), required=False)
+    client = ZoteroClient()
+    client.bootstrap()
+    out = paper_evidence_status(client, args.item_key)
+    out["projectRoot"] = str(root)
+    if config:
+        paper_index = project_paper_index(root, config)
+        out["inCurrentProject"] = args.item_key in paper_index
+        project_row = paper_index.get(args.item_key)
+        out["projectPaper"] = ({
+            "itemKey": project_row.get("itemKey"),
+            "title": project_row.get("title"),
+            "pdfStatus": project_row.get("pdfStatus"),
+            "projectPath": project_row.get("projectPath"),
+            "attachmentKey": project_row.get("attachmentKey"),
+        } if project_row else None)
+        out["claims"] = claims_for_paper(root, config, args.item_key)
+        out["claimsFile"] = str(config.get("claimsFile") or CLAIMS_FILE)
+    else:
+        out["inCurrentProject"] = None
+        out["claims"] = []
+    return out
+
+
+def cmd_record_claim(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    return record_claim_local(
+        root,
+        config,
+        claim=args.claim,
+        claim_type=args.type,
+        papers=list(args.paper or []),
+        source_layer=args.source_layer,
+        locator=claim_locator_from_args(args),
+        source_ref=args.source_ref,
+        note=args.note,
+    )
+
+
+def cmd_audit(args: argparse.Namespace) -> dict[str, Any]:
+    root, config = load_project(requested_project_root(args))
+    assert config is not None
+    out = audit_claims_local(root, config, include_claims=bool(args.include_claims))
+    out["projectRoot"] = str(root)
+    if not args.check_sources:
+        out["zoteroContacted"] = False
+        return out
+
+    ledger = load_claims(root, config)
+    keys = sorted({
+        str(key)
+        for row in (ledger.get("claims") or [])
+        if isinstance(row, dict)
+        for key in (row.get("papers") or [])
+        if str(key)
+    })
+    client = ZoteroClient()
+    client.bootstrap()
+    checks: dict[str, Any] = {}
+    missing: list[str] = []
+    for key in keys:
+        try:
+            checks[key] = paper_evidence_status(client, key)
+        except ZPPError as exc:
+            checks[key] = {"itemKey": key, "error": exc.as_dict()}
+            missing.append(key)
+    out["zoteroContacted"] = True
+    out["sourceChecks"] = checks
+    out["unavailableSourceItemKeys"] = missing
+    original_source_unavailable: list[str] = []
+    for row in (ledger.get("claims") or []):
+        if not isinstance(row, dict) or row.get("sourceLayer") != "original-paper":
+            continue
+        papers = [str(x) for x in (row.get("papers") or [])]
+        if any(
+            isinstance(checks.get(key), dict)
+            and checks[key].get("sourceAvailability") == "metadata-only"
+            for key in papers
+        ):
+            original_source_unavailable.append(str(row.get("id") or ""))
+    out["originalSourceUnavailableClaimIds"] = [x for x in original_source_unavailable if x]
+    if missing:
+        out["verdict"] = "broken"
+    elif original_source_unavailable and out.get("verdict") == "clean":
+        out["verdict"] = "needs-review"
+    return out
+
+
 def cmd_import_metadata(args: argparse.Namespace) -> dict[str, Any]:
     root, config = load_project(requested_project_root(args))
     assert config is not None
@@ -3021,7 +3462,7 @@ def print_result(result: Any, as_json: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="zotero_papers.py", description="Project-oriented Zotero 10 helper for coding agents")
-    p.add_argument("--version", action="version", version="zotero-project-papers 0.4.0")
+    p.add_argument("--version", action="version", version="zotero-project-papers 0.5.1")
     p.add_argument("--project-root", help="Explicit project root; otherwise discover from the current working directory")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -3113,6 +3554,31 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-chars", type=int, default=100000)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_fulltext)
+
+    s = sub.add_parser("evidence", help="Report whether a project paper is backed by Zotero metadata, a PDF, or indexed original full text")
+    s.add_argument("item_key")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_evidence)
+
+    s = sub.add_parser("record-claim", help="Record a project claim with explicit provenance in papers/claims.json")
+    s.add_argument("--claim", required=True, help="The scientific/technical claim being used in the project")
+    s.add_argument("--type", required=True, choices=["primary", "summary", "inference", "hypothesis"], help="Whether this is a direct paper claim, AI summary, cross-paper inference, or project hypothesis")
+    s.add_argument("--paper", action="append", default=[], help="Supporting Zotero item key; repeat for multiple papers")
+    s.add_argument("--source-layer", choices=["original-paper", "ai-summary", "agent-inference", "metadata"], help="Override the default provenance layer inferred from --type")
+    s.add_argument("--page", help="Page or page range in the source paper")
+    s.add_argument("--section", help="Section name/number in the source paper")
+    s.add_argument("--table", help="Table identifier in the source paper")
+    s.add_argument("--figure", help="Figure identifier in the source paper")
+    s.add_argument("--source-ref", help="Optional project-local summary/note reference used to derive the claim")
+    s.add_argument("--note", help="Optional audit note; do not use this as a substitute for a source locator")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_record_claim)
+
+    s = sub.add_parser("audit", help="Audit claim provenance and citation traceability without pretending to semantically verify claims")
+    s.add_argument("--check-sources", action="store_true", help="Also contact Zotero and verify that referenced items/PDF/fulltext are available")
+    s.add_argument("--include-claims", action="store_true", help="Include individual claim text/details; default output is a compact summary")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_audit)
 
     s = sub.add_parser("import-metadata", help="Create/reuse a Zotero bibliographic item without requiring a PDF")
     s.add_argument("metadata", help="UTF-8 Zotero-style metadata JSON; title is required")

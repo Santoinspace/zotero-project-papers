@@ -38,6 +38,16 @@
       "id": "ordinary-design",
       "text": "帮我把这个模型方案改得更简单一些。",
       "shouldTrigger": false
+    },
+    {
+      "id": "explicit-citation-audit",
+      "text": "请核验这段 related work 里的引用是否真的支持对应结论，并区分原文证据、AI总结和推断。",
+      "shouldTrigger": true
+    },
+    {
+      "id": "generic-peer-review-no-citation-audit",
+      "text": "帮我模拟审稿人看看这段方法描述是否清晰，有哪些表达问题。",
+      "shouldTrigger": false
     }
   ],
   "conversationRegression": {

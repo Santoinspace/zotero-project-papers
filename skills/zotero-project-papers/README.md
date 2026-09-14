@@ -1,16 +1,33 @@
 # Zotero Project Papers
 
-**A Zotero-first paper workflow for Claude Code, Codex, and other coding agents — but only when you explicitly ask for papers.**
+**A Zotero-first paper workflow for Claude Code, Codex, and other coding agents — only when you explicitly ask for papers.**
 
-Zotero Project Papers connects the research/coding project you are currently working on with your local Zotero library. When you explicitly ask an agent to find or reference academic papers, it checks your project and Zotero before going to the web, reuses PDFs you already have, and archives the papers actually used by the project.
+Zotero Project Papers connects the research/coding project you are currently working on with your local Zotero library. When you explicitly ask an agent to find, compare, cite, or verify academic papers, it checks your project and Zotero before going to the web, reuses papers you already have, and archives the papers actually used by the project.
 
 Zotero remains where **you** manage and read papers. Your project's reference directory is where **the agent** works with the papers relevant to that project.
 
-## The most important behavior in v0.4
+```text
+Zotero library                                  Current project
 
-This Skill is intentionally **not always-on**.
+All of your papers                              code/
+        │                                       experiments/
+        │                                       manuscript/
+        └──── project collection ─────────────► papers/reference/
+                                                papers/references.bib
+                                                papers/reference/papers.json
 
-It should activate when you explicitly say things like:
+Evidence provenance
+
+original paper ──► AI summary ──► Agent inference ──► project claim / manuscript
+      ▲                                                    │
+      └──────── citation audit / source traceability ──────┘
+```
+
+## Core behavior
+
+This Skill is intentionally **not always-on**. It should activate only when you explicitly ask to search, use, cite, or verify academic literature.
+
+Typical triggers:
 
 > 请参考 2026 年的顶级会议论文，给我几个动机强、改动小、逻辑自洽的方向。
 
@@ -18,112 +35,39 @@ It should activate when you explicitly say things like:
 
 > Find recent ICLR/NeurIPS papers about this topic.
 
-> 根据当前项目 reference 里的论文写 related work。
+> 核验这些引用是否真的支持对应结论。
 
-It should **not** activate just because a technical question could benefit from citations:
-
-> 这个思路从理论上成立吗？
-
-> 训练时这个模块应该怎么做？
-
-> 这种拒绝预测机制有什么影响？
-
-> 这个方向有人研究吗？
-
-In a mixed conversation, the Skill should wait until the user explicitly switches to paper/literature retrieval.
-
-## Why local-first should actually be fast
-
-v0.4 uses this search order:
-
-```text
-1. Current-project papers.json
-   ↓ local JSON, no Zotero call
-2. Local Zotero metadata cache, if already warmed
-   ↓ compact SQLite + incremental refresh
-3. Direct Zotero Local API metadata search
-   ↓ localhost
-4. Zotero indexed full-text search
-   ↓ bounded fallback
-5. Web search
-```
-
-The CLI reports `source`, `latencyMs`, `zoteroContacted`, and `webNeeded` so the fast path is observable.
-
-Search output is brief by default and limited to 10 candidates. The agent should fetch details only for promising papers instead of dumping many abstracts into context.
-
-### Optional metadata-cache warmup
-
-The first search **does not build a full-library cache automatically**. That could make first use slower than simply querying Zotero.
-
-If you do many broad literature searches and want the fastest repeated local lookup, warm the cache once:
-
-```bash
-python scripts/zotero_papers.py cache --refresh --json
-```
-
-Later cache refreshes use Zotero's local object versions and `?since=<version>` to fetch only changes. Cache data is partitioned by `Zotero-Server-ID`.
-
-## Automatic evidence archiving
-
-A paper found during search is only a **candidate**.
-
-A paper becomes **project evidence** when the agent actually relies on it in the final analysis, design, comparison, implementation, or citation.
-
-For an explicit literature task, the Skill should automatically:
-
-- add Zotero-local evidence papers to the project's Zotero collection;
-- expose their Zotero-managed PDFs in the configured project reference directory;
-- import web-found papers actually used as evidence into Zotero when a reliable PDF is available;
-- avoid importing the rest of the search candidates.
-
-So a top-conference search might inspect 20 candidates but archive only the 5 papers actually used in the answer.
-
-## Features
-
-- Narrow, explicit activation policy — no surprise literature searches during ordinary technical discussion.
-- Project manifest fast path with no Zotero API call on a hit.
-- Optional compact SQLite Zotero metadata cache.
-- Incremental cache updates using Zotero local library versions.
-- Direct Zotero metadata and indexed full-text fallback before web search.
-- One Zotero collection per project, e.g. `Projects/MyResearchProject`.
-- Configurable project reference directory (`papers/reference`, `references`, `literature`, etc.).
-- Existing-reference-directory onboarding: use existing, keep separate, or explicitly flatten/merge PDFs.
-- Cheap consistency preflight that can reuse previous state without contacting Zotero.
-- Drift acknowledgement so the same mismatch does not repeatedly interrupt you.
-- Safe reconciliation for manually added/deleted/replaced PDFs.
-- Hard links when possible to avoid duplicate PDF storage.
-- New PDFs imported through Zotero 10 rather than copied into `Zotero/storage` manually.
-- `papers.json` and project BibTeX generation.
-- Case-insensitive Zotero HTTP headers and layered `doctor` diagnostics.
-- Sandbox-safe authorization preflight with optional `ZPP_AUTH_STORE`.
-- Metadata-only evidence items (`import-metadata` / `import-doi`) and later `attach-pdf`.
-- Match explanations (`matchType`, `matchedFields`, score) with DOI/arXiv/title-first ranking.
-- Compact sync JSON by default; full paper arrays are opt-in.
-- DOI-based Crossref enrichment and a conservative validated `fetch` helper.
-- Optional Zotero tags and project child-collection organization.
-- Compact machine-readable errors and Windows-safe UTF-8 output.
-- No third-party Python dependencies.
+Ordinary technical questions should **not** activate the Skill just because papers might be useful.
 
 ## Requirements
 
 - **Zotero 10+**
 - **Python 3.10+**
-- Zotero running while Zotero operations are needed
+- Zotero running when Zotero operations are needed
 - Zotero → **Settings → Advanced → Allow other applications on this computer to communicate with Zotero**
 - Claude Code, Codex, or another coding agent that can run local commands
 
 ## Install with CC Switch
 
-CC Switch is the recommended installer/updater.
+CC Switch is the recommended installer and updater.
 
 1. Open **CC Switch → Skills → Repository Management → Add Repository**.
-2. Add this GitHub repository.
-3. Use branch `main` and Skills path `skills`.
+2. Add repository **`Santoinspace/zotero-project-papers`**.
+3. Use branch **`main`** and Skills path **`skills`**.
 4. Refresh the Skills list.
 5. Install **`zotero-project-papers`** and sync it to Claude Code/Codex.
 
-Do not keep permanent edits inside CC Switch's managed Skill directory; updates can replace them.
+### Upgrading
+
+Updates are designed to be **in-place and backward compatible**:
+
+- existing `.zotero-project.json` files are migrated automatically when needed;
+- your configured reference directory, BibTeX path, and existing project binding are preserved;
+- updates do not require you to manually move or delete papers;
+- an upgrade never treats a missing local PDF as permission to delete the Zotero item;
+- destructive cleanup still requires an explicit user action.
+
+Do not keep permanent edits inside CC Switch's managed Skill directory; an update may replace the installed copy. Submit fixes upstream instead.
 
 ## Quick start
 
@@ -134,13 +78,19 @@ cd my-research-project
 claude
 ```
 
-Then keep working normally. The Skill should remain inactive until you explicitly ask for papers.
+Then work normally. The Skill should remain inactive until you explicitly ask for papers.
 
-For example:
+Examples:
 
-> 我不认可现在的方案。请参考 2026 年顶级会议论文，给我几个适合当前项目的创新方向。
+> 请参考 2026 年顶级会议论文，给我几个适合当前项目的创新方向。
 
-At that point the intended flow is:
+> 从 Zotero 和当前 reference 里找关于这个问题的论文，本地不够再搜索网页。
+
+> 根据本项目 reference 里的论文写 related work，并更新 BibTeX。
+
+> 检查这段 related work 的引用是否真的支持对应结论，区分原文、AI 总结和推断。
+
+The intended retrieval flow is:
 
 ```text
 project papers.json
@@ -156,43 +106,101 @@ papers actually used as evidence
 Zotero project collection + project reference directory
 ```
 
-## First use and reference directories
+## Project setup and existing reference folders
 
-The default suggested directory is:
+The default reference directory is `papers/reference/`, but it is configurable. You can use `references/`, `literature/`, `papers/refs/`, or another project-relative path.
 
-```text
-papers/reference/
-```
+If the project already has a reference folder, the Skill should ask whether to:
 
-but it is configurable. You can use `references/`, `literature/`, `papers/refs/`, or another project-relative path.
+- **use the existing directory** and preserve its subdirectories;
+- **keep it separate** and create a new managed directory;
+- **merge PDFs** into a new flat directory while preserving the original folder and safely renaming collisions.
 
-If the project already contains a likely reference folder, the Skill should ask whether to:
+Manual edits are allowed. If you add, delete, or replace PDFs yourself, the Skill compares the Zotero project collection, `papers.json`, and the actual reference directory. If you choose “continue for now”, the same mismatch is remembered and will not repeatedly interrupt you. You can later ask the agent to **reconcile / 统一** at any time.
 
-1. **Use the existing directory** and preserve its subdirectories.
-2. **Keep it separate** and create a new managed directory.
-3. **Merge PDFs** into a new flat directory. Only PDFs are flattened; the original directory is preserved and filename collisions are renamed safely.
+Zotero remains the canonical source for managed papers; local-only and user-modified files are preserved unless you explicitly request deletion.
 
-## Manual edits are allowed
+## Local-first should actually be fast
 
-You can manually add, remove, or replace PDFs in the reference directory.
-
-The Skill tracks drift between:
+The search order is:
 
 ```text
-Zotero project collection
-        ↕
-papers.json
-        ↕
-actual project PDFs
+1. Current-project papers.json
+   ↓ local JSON, no Zotero call
+2. Local Zotero metadata cache, if already available
+   ↓ compact SQLite + incremental refresh
+3. Direct Zotero Local API metadata search
+   ↓ localhost
+4. Zotero indexed full-text search
+   ↓ bounded fallback
+5. Web search
 ```
 
-If you choose “continue for now”, it remembers that exact mismatch and does not ask again until something changes. If you later ask the agent to “统一 / reconcile”, Zotero remains the canonical source for managed papers, while local-only/user-modified files are preserved unless you explicitly request deletion.
+Search output is brief by default and limited to a small candidate set. The agent should request details only for promising papers instead of dumping many abstracts into context.
+
+For users who frequently search a large Zotero library, the metadata cache can be warmed once:
+
+```bash
+python scripts/zotero_papers.py cache --refresh --json
+```
+
+The first search does **not** build a full-library cache automatically.
+
+## Automatic evidence archiving
+
+A search result is only a **candidate**. A paper becomes **project evidence** when the agent actually relies on it in the final analysis, design, comparison, implementation, or citation.
+
+For an explicit literature task, the Skill should automatically:
+
+- add Zotero-local evidence papers to the project's Zotero collection;
+- expose Zotero-managed PDFs in the configured project reference directory;
+- preserve useful metadata-only papers even when a PDF is not yet available;
+- import web-found papers actually used as evidence when reliable metadata/PDFs are available;
+- avoid importing the rest of the search candidates.
+
+## Evidence provenance and citation audit
+
+A real citation does not automatically mean the cited paper supports the sentence attached to it. Zotero Project Papers can keep a lightweight project evidence ledger in `papers/claims.json` and distinguish:
+
+- **primary** — directly supported by the original paper;
+- **summary** — an AI-generated summary or paraphrase;
+- **inference** — an Agent synthesis across paper evidence;
+- **hypothesis** — a new project idea, not an established literature claim.
+
+The provenance flow is:
+
+```text
+paper / full text
+      ↓
+primary evidence
+      ↓
+AI summary
+      ↓
+Agent inference
+      ↓
+project claim / manuscript
+
+citation audit ──► trace important claims back to the original source
+```
+
+`audit` checks **traceability**, not semantic truth. When you ask the Agent to verify citations or simulate peer review, it should still return to the relevant original page, section, table, or figure before claiming that a paper truly supports a statement.
+
+## Core features
+
+- Explicit activation: no surprise literature search during ordinary technical discussion.
+- Zotero-first local search with project-manifest and optional metadata-cache fast paths.
+- One Zotero collection per project with a configurable reference directory.
+- Reuse Zotero-managed PDFs, using hard links when possible to avoid duplicate storage.
+- Safe handling of existing folders and manual PDF changes.
+- Metadata-only papers, DOI-based import/enrichment, and later PDF attachment.
+- Automatic `papers.json` and project BibTeX generation.
+- Claim provenance and lightweight citation/source audit.
+- Compact machine-readable output designed for coding agents.
+- No third-party Python dependencies.
 
 ## Zotero remains the source of truth
 
 The Skill never writes directly to `zotero.sqlite` or fabricates folders inside `Zotero/storage`.
-
-For new PDFs:
 
 ```text
 Web/local PDF
@@ -219,7 +227,8 @@ my-project/
     │   ├── papers.json
     │   ├── paper-a.pdf
     │   └── paper-b.pdf
-    └── references.bib
+    ├── references.bib
+    └── claims.json
 ```
 
 Zotero gets a matching collection:
@@ -229,78 +238,46 @@ Projects/
 └── my-project/
 ```
 
-## Useful manual/debug commands
+## Useful commands
 
-Normal users should rarely need these; agents invoke them automatically.
+Normal users should rarely need to run these manually; agents invoke them automatically.
 
-```bash
-# Fast consistency preflight
-python scripts/zotero_papers.py check --json
-
-# Force full consistency comparison
-python scripts/zotero_papers.py check --full --json
-
-# Search current project
-python scripts/zotero_papers.py search "query" --scope project --json
-
-# Search whole local Zotero library
-python scripts/zotero_papers.py search "query" --scope library --json
-
-# Optional one-time cache warmup
-python scripts/zotero_papers.py cache --refresh --json
-```
-
-## Metadata-only papers and later PDF attachment
-
-A project evidence set no longer requires every paper to have a downloadable PDF. If a paper is important but only reliable metadata is available, the agent can add it to Zotero/current project first:
+Base command:
 
 ```bash
-python scripts/zotero_papers.py import-metadata paper.json --json
-# or, when a DOI is known
-python scripts/zotero_papers.py import-doi 10.xxxx/xxxx --json
+python scripts/zotero_papers.py <command> [options]
 ```
 
-`papers.json` marks it with `pdfStatus: "missing"`. A PDF can be attached later:
+| Command | Common options | What it does |
+|---|---|---|
+| `doctor` | `--json` | Diagnose Zotero, Local API, authorization, and project binding. |
+| `check` | `--json`, `--full`, `--ack-continue` | Check project/Zotero/reference consistency. |
+| `search "QUERY"` | `--scope project\|library`, `--fulltext`, `--json` | Search current project or the local Zotero library. |
+| `show ITEM_KEY` | `--json` | Show detailed metadata for one candidate paper. |
+| `cache` | `--refresh`, `--json` | Build or incrementally refresh the optional local metadata cache. |
+| `add ITEM_KEY` | `--json` | Add an existing Zotero paper to the current project. |
+| `sync` | `--json`, `--prune` | Refresh project PDFs, `papers.json`, and BibTeX. |
+| `reconcile` | `--json` | Reconcile project state toward the Zotero project collection. |
+| `import-doi DOI` | `--json` | Add/reuse a paper from DOI metadata even without a PDF. |
+| `import-metadata FILE` | `--json` | Add/reuse a metadata-only paper from JSON. |
+| `attach-pdf ITEM_KEY PDF` | `--json` | Attach a PDF later to an existing Zotero paper. |
+| `evidence ITEM_KEY` | `--json` | Report whether original PDF/full text is available for a project paper. |
+| `record-claim` | `--type`, `--paper`, `--claim`, source locator options | Record an important project claim with explicit provenance. |
+| `audit` | `--json`, `--check-sources` | Audit claim provenance and citation traceability. |
+| `enrich ITEM_KEY` | `--apply`, `--json` | Preview/apply DOI-based bibliographic metadata enrichment. |
+| `fetch URL` | `--metadata FILE`, `--import`, `--json` | Validate a selected academic PDF URL and optionally import it. |
 
-```bash
-python scripts/zotero_papers.py attach-pdf ITEM_KEY paper.pdf --json
-```
+Use `python scripts/zotero_papers.py <command> --help` for the complete arguments.
 
-## Better diagnostics in sandboxed agents
+## Feedback and issues
 
-`doctor --json` now distinguishes Zotero unreachable, Local API disabled, authorization needed, unsupported version, malformed/unexpected local responses, and an unwritable authorization store. It does not ask the agent to change GUI settings when the evidence is ambiguous.
+This project is still evolving through real research workflows. If you encounter a bug, unexpected Agent behavior, Zotero compatibility issue, or a workflow that feels unnecessarily slow or intrusive, please open an issue on GitHub.
 
-If a sandbox cannot write the normal user config directory, choose a **private, gitignored** path:
+When possible, include:
 
-```bash
-ZPP_AUTH_STORE=/path/to/private/auth.json python scripts/zotero_papers.py authorize --json
-```
+- Zotero version and operating system;
+- the command/Agent request that triggered the issue;
+- the compact JSON error or diagnostic output;
+- a privacy-sanitized description of the project state.
 
-## Validated paper fetch and DOI enrichment
-
-The helper does not replace the host agent's web search. After the agent selects an actual evidence paper, it can use a known official/OA PDF URL:
-
-```bash
-python scripts/zotero_papers.py fetch https://.../paper.pdf --metadata paper.json --import --json
-```
-
-The fetch helper uses HTTPS, follows redirects, validates PDF structure at a lightweight stdlib level, computes SHA-256, and is conservative about unfamiliar hosts. It does **not** claim that access rights are automatically verified.
-
-For DOI-bearing records, Crossref can fill common bibliographic fields:
-
-```bash
-python scripts/zotero_papers.py enrich ITEM_KEY --json
-python scripts/zotero_papers.py enrich ITEM_KEY --apply --json
-```
-
-## Topic organization (optional)
-
-When you explicitly want research-question views, the agent can add Zotero tags or create project child collections from a small JSON topic map. This is optional; the default project collection remains flat and simple.
-
-## Privacy of activation regression tests
-
-The repository includes a small activation regression fixture based on a real interaction pattern. It is **synthetic and privacy-sanitized**: it preserves only the conversational structure “technical discussion → explicit request for top-conference papers”. It contains no source project names, model names, dataset names, paper titles, URLs, paths, or experimental metrics.
-
-## Project status
-
-This is an early-stage open-source project being tested on real research workflows. Bug reports and workflow feedback are welcome, especially around Zotero Local API compatibility, paper deduplication, metadata quality, and agent activation behavior.
+Please avoid posting private paper libraries, unpublished manuscript content, local paths, tokens, or sensitive project data.

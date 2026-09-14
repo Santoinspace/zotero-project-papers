@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.5.1 — Backward-Compatible Upgrades & User-Facing README
+
+### Upgrade compatibility
+
+- Formalized an in-place upgrade contract: existing projects must not require manual deletion, directory rebuilding, or bulk file moves after normal Skill updates.
+- Added regression tests across project config schemas v1–v5 to ensure custom reference/BibTeX/claims paths, Zotero collection bindings, fallback policy, and acknowledged drift state are preserved.
+- Added a regression test proving that loading/migrating an older project config does not move or delete existing reference PDFs or create a new default reference directory.
+- Added a CLI compatibility test covering all commands published through v0.5.0.
+- Kept persisted config schema at v5 because this patch release does not change the on-disk config shape.
+- Added a Skill-level rule that upgrades themselves must not trigger Zotero writes, bulk syncs, cache warmups, file moves, pruning, or destructive cleanup.
+
+### README
+
+- Reworked the README around the user workflow rather than implementation details.
+- Preserved the CC Switch repository path `Santoinspace/zotero-project-papers`.
+- Added a combined Zotero/project workflow diagram and evidence-provenance diagram.
+- Shortened activation and feature explanations.
+- Consolidated first-use/reference-directory/manual-edit guidance.
+- Added practical prompt examples and a compact command table.
+- Added an explicit upgrade section and a GitHub issue/feedback section with privacy guidance.
+
+## 0.5.0 — Evidence Provenance & Citation Audit
+
+### Claim-level provenance
+
+- Added `papers/claims.json`, a lightweight project claim ledger separate from `papers.json` and BibTeX.
+- Added four claim types: `primary`, `summary`, `inference`, and `hypothesis`.
+- Added explicit source layers: `original-paper`, `ai-summary`, `agent-inference`, and `metadata`.
+- Added `record-claim` with optional page/section/table/figure locators and duplicate suppression.
+- Direct `primary` claims require an original-paper source layer and warn when no reproducible source locator is provided.
+- Claim recording is local-only and refuses dangling paper keys that are not in the current project manifest.
+
+### Citation/source audit
+
+- Added `evidence ITEM_KEY` to report metadata-only vs PDF vs Zotero-indexed full-text availability for a paper.
+- Added `audit` for cheap local provenance/traceability checks without contacting Zotero.
+- Added opt-in `audit --check-sources` to verify referenced Zotero items/PDF/full-text availability.
+- Audits distinguish original-paper claims, AI-summary-derived claims, Agent inferences, hypotheses, metadata-only claims, missing locators, missing original PDFs, and broken project-paper references.
+- Audit output explicitly states that semantic verification was **not** performed; a real citation/PDF is not treated as proof that the paper supports the claim.
+
+### Activation and review behavior
+
+- Citation verification is now a narrow explicit activation trigger: the Skill may activate when the user explicitly asks whether citations/papers support claims.
+- Generic peer review/editing requests still do not activate the Skill unless citation/evidence verification is explicitly requested.
+- Added privacy-sanitized activation regression cases for citation audit vs generic peer review.
+
+### Privacy and compatibility
+
+- Claim ledgers do not store the user's absolute project path.
+- Project config schema upgraded to v5 with a configurable `claimsFile`; older configs migrate automatically.
+- Retains v0.4's case-insensitive Zotero headers, layered diagnostics, metadata-only import, exact-first matching, compact JSON, Crossref enrichment, and conservative PDF fetch behavior.
+
 ## 0.4.0 — Robust Local API, Metadata-Only Evidence, Better Matching
 
 ### P0 compatibility and diagnosis
